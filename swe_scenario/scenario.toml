@@ -1,0 +1,16 @@
+[green_agent]
+endpoint = "http://127.0.0.1:9020"
+cmd = "python src/swe_green_agent/agent.py --host 127.0.0.1 --port 9020"
+
+[[participants]]
+role = "agent"
+endpoint = "http://127.0.0.1:9021"
+cmd = "python swe_scenario/dummy_llm.py --host 127.0.0.1 --port 9021"
+
+[config]
+# These values will be overridden by the parquet file in the agent logic, 
+# but we provide defaults or placeholders here if needed by the runner.
+repo_url = "https://github.com/astropy/astropy" 
+base_commit = "main"
+hints_text = "Fix it"
+problem_statement = "It is broken"
