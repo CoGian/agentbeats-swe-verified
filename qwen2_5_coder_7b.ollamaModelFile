@@ -1,0 +1,3 @@
+FROM qwen2.5-coder:7b
+# Set the context window size (e.g., 4096, 8192, 16384, etc.)
+PARAMETER num_ctx 16384
