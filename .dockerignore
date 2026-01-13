@@ -61,3 +61,5 @@ Thumbs.db
 .cache/
 .mypy_cache/
 .ruff_cache/
+
+/swe_scenario

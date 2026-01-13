@@ -128,17 +128,32 @@ uv run swe_scenario/dummy_llm.py --host 127.0.0.1 --port 9021
 
 ## 🐳 Docker
 
-### Building the Docker Image
+### Using Pre-built Image (Recommended)
+
+Pull the latest image from GitHub Container Registry:
 
 ```bash
-docker build -t agentbeats-swe-verified .
+docker pull ghcr.io/cogian/agentbeats-swe-verified:v1.0
 ```
 
-### Running with Docker
+Run the container:
 
 ```bash
+# Run with GPU support
+docker run --gpus all -p 9020:9020 ghcr.io/cogian/agentbeats-swe-verified:v1.0
+
 # Run with environment variables from .env file
-docker run --gpus all --env-file .env -p 9020:9020 agentbeats-swe-verified
+docker run --gpus all --env-file .env -p 9020:9020 ghcr.io/cogian/agentbeats-swe-verified:v1.0
+```
+
+### Building Locally
+
+```bash
+# Build the image
+docker build -t agentbeats-swe-verified .
+
+# Run locally built image
+docker run --gpus all -p 9020:9020 agentbeats-swe-verified
 ```
 
 ## 📁 Project Structure

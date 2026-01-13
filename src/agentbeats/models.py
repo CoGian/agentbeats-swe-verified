@@ -6,5 +6,6 @@ class EvalRequest(BaseModel):
     config: dict[str, Any]
 
 class EvalResult(BaseModel):
-    winner: str # role of winner
-    detail: dict[str, Any]
+    total_instances: int
+    total_resolved: int
+    resolution_rate: float

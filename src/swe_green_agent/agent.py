@@ -164,6 +164,7 @@ class SweVerifiedGreenAgent(GreenAgent):
     def __init__(self):
         self._required_config_keys = []  # Config values come from parquet file
         self._tool_provider = ToolProvider()
+        self._model = "ollama/qwen2.5-coder:7b"  # Default model, can be overridden in run_eval
 
     def validate_request(self, request: EvalRequest) -> tuple[bool, str]:
         missing_config_keys = set(self._required_config_keys) - set(request.config.keys())
@@ -176,7 +177,7 @@ class SweVerifiedGreenAgent(GreenAgent):
         return True, "ok"
 
     async def _run_agentic_loop(self, repo_dir: str, system_prompt: str, user_message: str, 
-                                  phase_name: str, updater: TaskUpdater, max_iterations: int = 10) -> None:
+                                  phase_name: str, updater: TaskUpdater, max_iterations: int = 10, model: str = None) -> None:
         """Run a focused agentic loop with the given prompt."""
         messages = [
             {"role": "system", "content": system_prompt},
@@ -201,7 +202,7 @@ class SweVerifiedGreenAgent(GreenAgent):
             
             try:
                 response = await litellm.acompletion(
-                    model="ollama/qwen2.5-coder:7b",
+                    model=model or self._model,
                     messages=messages,
                     tools=TOOLS,
                     tool_choice="auto"
@@ -314,7 +315,7 @@ class SweVerifiedGreenAgent(GreenAgent):
         else:
             logger.warning(f"[{phase_name}] ⚠ Reached max iterations ({max_iterations})")
 
-    async def _run_env_setup(self, repo_dir: str, file_listing: str, updater: TaskUpdater) -> None:
+    async def _run_env_setup(self, repo_dir: str, file_listing: str, updater: TaskUpdater, model: str = None) -> None:
         """Phase 1: Identify Python version, install it, create venv."""
         await self._run_agentic_loop(
             repo_dir=repo_dir,
@@ -322,10 +323,11 @@ class SweVerifiedGreenAgent(GreenAgent):
             user_message=f"Repository files:\n{file_listing}",
             phase_name="ENV_SETUP",
             updater=updater,
-            max_iterations=8
+            max_iterations=8,
+            model=model
         )
 
-    async def _run_deps_install(self, repo_dir: str, file_listing: str, updater: TaskUpdater) -> None:
+    async def _run_deps_install(self, repo_dir: str, file_listing: str, updater: TaskUpdater, model: str = None) -> None:
         """Phase 2: Install build deps, package, and test deps."""
         await self._run_agentic_loop(
             repo_dir=repo_dir,
@@ -333,7 +335,8 @@ class SweVerifiedGreenAgent(GreenAgent):
             user_message=f"Repository files:\n{file_listing}",
             phase_name="DEPS_INSTALL",
             updater=updater,
-            max_iterations=8
+            max_iterations=8,
+            model=model
         )
 
 
@@ -344,7 +347,8 @@ class SweVerifiedGreenAgent(GreenAgent):
         total_rows: int, 
         participant_url: str, 
         updater: TaskUpdater,
-        semaphore: asyncio.Semaphore
+        semaphore: asyncio.Semaphore,
+        model: str = None
     ) -> dict:
         """Process a single row/instance. Returns result dict."""
         async with semaphore:
@@ -414,13 +418,13 @@ class SweVerifiedGreenAgent(GreenAgent):
                 # PHASE 2A: Environment Setup (Python + venv)
                 # =============================================
                 await updater.update_status(TaskState.working, new_agent_text_message(f"[{instance_id}] Phase 1: Setting up Python environment..."))
-                await self._run_env_setup(temp_dir, file_listing, updater)
+                await self._run_env_setup(temp_dir, file_listing, updater, model=model)
                 
                 # =============================================
                 # PHASE 2B: Dependency Installation
                 # =============================================
                 await updater.update_status(TaskState.working, new_agent_text_message(f"[{instance_id}] Phase 2: Installing dependencies..."))
-                await self._run_deps_install(temp_dir, file_listing, updater)
+                await self._run_deps_install(temp_dir, file_listing, updater, model=model)
                 
                 # =============================================
                 # PHASE 3: Switch to base_commit for patch application
@@ -468,21 +472,12 @@ class SweVerifiedGreenAgent(GreenAgent):
                     with open(patch_file, "w") as f:
                         f.write(patch_content)
                     
-                    # Apply patch using git apply
-                    await updater.update_status(TaskState.working, new_agent_text_message(f"[{instance_id}] Applying patch with 'git apply'..."))
-                    patch_result = subprocess.run(
-                        ["git", "apply", "proposed.patch"],
-                        cwd=temp_dir,
-                        capture_output=True,
-                        text=True
-                    )
+                    # Apply patch using multiple strategies
+                    await updater.update_status(TaskState.working, new_agent_text_message(f"[{instance_id}] Applying patch..."))
+                    patch_applied, apply_method = await self._apply_patch_with_fallbacks(temp_dir, "proposed.patch", updater, instance_id)
                     
-                    if patch_result.returncode == 0:
-                        patch_applied = True
-                        logger.info(f"Patch applied successfully:\n{patch_result.stdout}")
-                    else:
-                        logger.error(f"Patch failed to apply:\n{patch_result.stderr}")
-                        await updater.update_status(TaskState.working, new_agent_text_message(f"[{instance_id}] Patch failed to apply: {patch_result.stderr[:200]}"))
+                    if patch_applied:
+                        logger.info(f"Patch applied successfully using: {apply_method}")
                 else:
                     logger.warning("No patch found in agent response")
                     await updater.update_status(TaskState.working, new_agent_text_message(f"[{instance_id}] No patch found in agent response"))
@@ -550,10 +545,17 @@ class SweVerifiedGreenAgent(GreenAgent):
         
         # Configurable concurrency limit - read from config or default to 3
         MAX_CONCURRENT_ROWS = int(req.config.get("max_concurrent_rows", 3))
+        # Configurable max rows to process - read from config or default to -1 (all rows)
+        MAX_ROWS = int(req.config.get("max_rows", -1))
+        # Configurable model - read from config or use default
+        self._model = req.config.get("green_agent_model", "ollama/qwen2.5-coder:7b")
         
         # Load data from parquet
         try:
             df = pd.read_parquet("data/test-00000-of-00001.parquet")
+            # Limit to first MAX_ROWS (-1 or None means all rows)
+            if MAX_ROWS > 0:
+                df = df.head(MAX_ROWS)
         except Exception as e:
             logger.error(f"Failed to read from parquet: {e}")
             await updater.failed(new_agent_text_message(f"Failed to read data: {e}"))
@@ -576,7 +578,8 @@ class SweVerifiedGreenAgent(GreenAgent):
                 total_rows=total_rows,
                 participant_url=participant_url,
                 updater=updater,
-                semaphore=semaphore
+                semaphore=semaphore,
+                model=self._model
             )
             for row_idx, row in df.iterrows()
         ]
@@ -610,13 +613,9 @@ Concurrency: {MAX_CONCURRENT_ROWS} parallel workers
         await updater.update_status(TaskState.working, new_agent_text_message(metrics_summary))
 
         result = EvalResult(
-            winner=participant_role if total_resolved > 0 else "none",
-            detail={
-                "total_instances": total_rows,
-                "total_resolved": total_resolved,
-                "resolution_rate": total_resolved / total_rows * 100 if total_rows > 0 else 0,
-                "results": processed_results
-            }
+            total_instances=total_rows,
+            total_resolved=total_resolved,
+            resolution_rate=total_resolved / total_rows * 100 if total_rows > 0 else 0,
         )
         await updater.add_artifact(
             parts=[
@@ -625,6 +624,66 @@ Concurrency: {MAX_CONCURRENT_ROWS} parallel workers
             ],
             name="Result",
         )
+    
+    async def _apply_patch_with_fallbacks(self, repo_dir: str, patch_file: str, updater: TaskUpdater, instance_id: str) -> tuple[bool, str]:
+        """Try multiple strategies to apply a patch, handling common LLM errors.
+        
+        Strategies tried in order:
+        1. git apply (strict)
+        2. git apply --ignore-whitespace (handles whitespace issues)
+        3. git apply --3way (handles line number mismatches)
+        4. patch -p1 with fuzz factor (most lenient)
+        
+        Returns:
+            Tuple of (success: bool, method_used: str)
+        """
+        strategies = [
+            {
+                "name": "git apply",
+                "cmd": ["git", "apply", patch_file],
+            },
+            {
+                "name": "git apply --ignore-whitespace",
+                "cmd": ["git", "apply", "--ignore-whitespace", patch_file],
+            },
+            {
+                "name": "git apply --3way",
+                "cmd": ["git", "apply", "--3way", patch_file],
+            },
+            {
+                "name": "patch -p1 --fuzz=3",
+                "cmd": ["patch", "-p1", "--fuzz=3", "-i", patch_file],
+            },
+        ]
+        
+        last_error = ""
+        for strategy in strategies:
+            logger.info(f"[{instance_id}] Trying patch strategy: {strategy['name']}")
+            
+            result = subprocess.run(
+                strategy["cmd"],
+                cwd=repo_dir,
+                capture_output=True,
+                text=True
+            )
+            
+            if result.returncode == 0:
+                await updater.update_status(
+                    TaskState.working, 
+                    new_agent_text_message(f"[{instance_id}] Patch applied using: {strategy['name']}")
+                )
+                return True, strategy["name"]
+            else:
+                last_error = result.stderr or result.stdout
+                logger.warning(f"[{instance_id}] Strategy '{strategy['name']}' failed: {last_error[:200]}")
+        
+        # All strategies failed
+        logger.error(f"[{instance_id}] All patch strategies failed. Last error: {last_error}")
+        await updater.update_status(
+            TaskState.working, 
+            new_agent_text_message(f"[{instance_id}] Patch failed to apply (tried 4 strategies): {last_error[:150]}")
+        )
+        return False, "none"
     
     async def _transform_to_patch_with_llm(self, response: str) -> str | None:
         """Use LLM to transform code in the response into a proper unified diff patch.
@@ -738,10 +797,10 @@ GENERATED PATCH:"""
         
         return None
 
-    async def _ask_llm(self, prompt: str) -> str:
+    async def _ask_llm(self, prompt: str, model: str = None) -> str:
         try:
             response = await litellm.acompletion(
-                model="ollama/qwen2.5-coder:7b",
+                model=model or self._model,
                 messages=[{"role": "user", "content": prompt}]
             )
             content = response.choices[0].message.content

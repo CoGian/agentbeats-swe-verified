@@ -86,15 +86,30 @@ You MUST extract this path and use it with the tools.
 
 def _parse_repo_dir_from_context(context) -> str:
     """Extract REPO_DIR from the conversation context."""
-    # Try to get repo dir from the first message in the conversation
-    if hasattr(context, 'session') and hasattr(context.session, 'history'):
-        for message in context.session.history:
-            if hasattr(message, 'content') and message.content:
-                content = str(message.content)
-                if content.startswith("REPO_DIR:"):
-                    # Extract the path from the first line
-                    first_line = content.split('\n')[0]
-                    return first_line.replace("REPO_DIR:", "").strip()
+    # Try to get repo dir from the events in the session
+    if hasattr(context, 'session'):
+        session = context.session
+        # Check for events (ADK session structure)
+        events = getattr(session, 'events', None) or getattr(session, 'history', None) or []
+        for event in events:
+            content = getattr(event, 'content', None)
+            if content:
+                parts = getattr(content, 'parts', None)
+                if parts:
+                    for part in parts:
+                        text = getattr(part, 'text', None)
+                        if text and "REPO_DIR:" in text:
+                            # Find the line containing REPO_DIR
+                            for line in text.split('\n'):
+                                if line.startswith("REPO_DIR:"):
+                                    return line.replace("REPO_DIR:", "").strip()
+    else:
+        # Content is a plain string
+        text = str(content)
+        if "REPO_DIR:" in text:
+            for line in text.split('\n'):
+                if line.startswith("REPO_DIR:"):
+                    return line.replace("REPO_DIR:", "").strip()
     raise ValueError("REPO_DIR not found in message context. Expected format: REPO_DIR:/path/to/repo")
 
 
@@ -147,15 +162,20 @@ def main():
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Host to bind the server")
     parser.add_argument("--port", type=int, default=9021, help="Port to bind the server")
     parser.add_argument("--card-url", type=str, help="External URL to provide in the agent card")
+    parser.add_argument("--model", type=str, help="LLM model to use")
     args = parser.parse_args()
     
     ollama_api_base = os.getenv("OLLAMA_API_BASE", "http://localhost:11434")
-    ollama_model = os.getenv("DUMMY_OLLAMA_MODEL", "qwen2.5-coder:7b")
     
-    model = LiteLlm(
-        model=f"ollama_chat/{ollama_model}",
-        api_base=ollama_api_base
-    )
+    if "ollama" in args.model:
+        model = LiteLlm(
+            model=args.model,
+            api_base=ollama_api_base
+        )
+    else:
+        model = LiteLlm(
+            model=args.model,
+        )
 
     # Create tool instances
     read_file_tool = FunctionTool(read_file)
