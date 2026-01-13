@@ -14,8 +14,8 @@ from a2a.types import (
     AgentCard,
 )
 
-# Repository directory - will be set when provided
-REPO_DIR = os.getenv("REPO_DIR", "/tmp/repo")
+# Import shared tools
+from agentbeats.repo_tools import read_file as _read_file, grep_search as _grep_search, run_command as _run_command
 
 INSTRUCTION = """You will be provided with a partial code base and an issue statement explaining a problem to resolve.
 
@@ -78,34 +78,67 @@ return points
 </patch>
 
 You have access to tools to read files and run commands in the repository to help you understand the codebase and solve the issue.
+
+IMPORTANT: The first line of the message will contain the repository directory in the format: REPO_DIR:/path/to/repo
+You MUST extract this path and use it with the tools.
 """
 
 
-def read_file(file_path: str) -> str:
+def _parse_repo_dir_from_context(context) -> str:
+    """Extract REPO_DIR from the conversation context."""
+    # Try to get repo dir from the first message in the conversation
+    if hasattr(context, 'session') and hasattr(context.session, 'history'):
+        for message in context.session.history:
+            if hasattr(message, 'content') and message.content:
+                content = str(message.content)
+                if content.startswith("REPO_DIR:"):
+                    # Extract the path from the first line
+                    first_line = content.split('\n')[0]
+                    return first_line.replace("REPO_DIR:", "").strip()
+    raise ValueError("REPO_DIR not found in message context. Expected format: REPO_DIR:/path/to/repo")
+
+
+# Wrapper functions that use REPO_DIR (required by ADK FunctionTool)
+def read_file(file_path: str, tool_context=None) -> str:
     """Read contents of a file in the repository.
     
     Args:
         file_path: Path relative to repository root (e.g., 'README.md', 'src/main.py')
+        tool_context: ADK tool context (automatically passed)
     
     Returns:
         The file contents as a string, or an error message if the file cannot be read.
     """
-    full_path = os.path.join(REPO_DIR, file_path)
-    # Security: prevent path traversal
-    if not os.path.realpath(full_path).startswith(os.path.realpath(REPO_DIR)):
-        return "Error: Invalid file path (path traversal detected)"
-    if not os.path.exists(full_path):
-        return f"Error: File not found: {file_path}"
-    if os.path.isdir(full_path):
-        return f"Error: {file_path} is a directory, not a file"
-    try:
-        with open(full_path, "r") as f:
-            content = f.read()
-            if len(content) > 50000:
-                return content[:50000] + "\n\n... (file truncated, too large)"
-            return content
-    except Exception as e:
-        return f"Error reading file: {e}"
+    repo_dir = _parse_repo_dir_from_context(tool_context)
+    return _read_file(repo_dir, file_path)
+
+
+def grep_search(pattern: str, tool_context=None) -> str:
+    """Search for a pattern in repository files using grep.
+    
+    Args:
+        pattern: Pattern to search for (supports extended regex)
+        tool_context: ADK tool context (automatically passed)
+    
+    Returns:
+        Search results with file paths and line numbers, or error message.
+    """
+    repo_dir = _parse_repo_dir_from_context(tool_context)
+    return _grep_search(repo_dir, pattern)
+
+
+def run_command(command: str, tool_context=None) -> str:
+    """Execute a shell command in the repository directory.
+    
+    Args:
+        command: Shell command to execute
+        tool_context: ADK tool context (automatically passed)
+    
+    Returns:
+        Command output including stdout, stderr, and exit code.
+    """
+    repo_dir = _parse_repo_dir_from_context(tool_context)
+    return _run_command(repo_dir, command)
 
 
 
@@ -114,13 +147,7 @@ def main():
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Host to bind the server")
     parser.add_argument("--port", type=int, default=9021, help="Port to bind the server")
     parser.add_argument("--card-url", type=str, help="External URL to provide in the agent card")
-    parser.add_argument("--repo-dir", type=str, help="Repository directory for file operations")
     args = parser.parse_args()
-
-    # Set repo directory if provided
-    global REPO_DIR
-    if args.repo_dir:
-        REPO_DIR = args.repo_dir
     
     ollama_api_base = os.getenv("OLLAMA_API_BASE", "http://localhost:11434")
     ollama_model = os.getenv("DUMMY_OLLAMA_MODEL", "qwen2.5-coder:7b")
@@ -130,15 +157,17 @@ def main():
         api_base=ollama_api_base
     )
 
-    # Create tool instance
+    # Create tool instances
     read_file_tool = FunctionTool(read_file)
+    grep_search_tool = FunctionTool(grep_search)
+    run_command_tool = FunctionTool(run_command)
 
     root_agent = Agent(
         name="dummy_llm",
         model=model,
         description="A dummy agent that solves issues by generating patch files.",
         instruction=INSTRUCTION,
-        tools=[read_file_tool],
+        tools=[read_file_tool, grep_search_tool, run_command_tool],
     )
 
     agent_card = AgentCard(

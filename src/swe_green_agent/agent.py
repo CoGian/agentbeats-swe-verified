@@ -24,6 +24,7 @@ from agentbeats.green_executor import GreenAgent, GreenExecutor
 from agentbeats.models import EvalRequest, EvalResult
 from agentbeats.tool_provider import ToolProvider
 from agentbeats.cloudflare import quick_tunnel
+from agentbeats.repo_tools import read_file, run_command, grep_search
 from loguru import logger
 
 load_dotenv()
@@ -53,6 +54,23 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "grep_search",
+            "description": "Search for a pattern in repository files using grep. Use to find Python version requirements, dependencies, etc.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Pattern to search for (e.g., 'requires-python', 'python_requires')"
+                    }
+                },
+                "required": ["pattern"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "run_command",
             "description": "Execute a shell command in the repository directory. Use for: creating venv, pip install, running setup scripts",
             "parameters": {
@@ -60,7 +78,7 @@ TOOLS = [
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "Shell command to execute (e.g., 'python3.11 -m venv .venv', 'pip install -e .')"
+                        "description": "Shell command to execute (e.g., 'uv python install 3.11', 'uv venv --python 3.11')"
                     }
                 },
                 "required": ["command"]
@@ -69,60 +87,82 @@ TOOLS = [
     }
 ]
 
-# System prompt for Phase 1: Environment Setup (Python version + venv)
-ENV_SETUP_PROMPT = """You are an expert at setting up Python environments.
+# System prompt for Phase 1: Environment Setup (Python version + venv + pip)
+ENV_SETUP_PROMPT = """You are setting up a Python environment for a repository.
 
-## YOUR TASK: Create a virtual environment with the correct Python version.
+## TASK: Create a virtual environment with the correct Python version.
 
-## Steps:
-1. Read pyproject.toml or setup.py to find the required Python version
-2. Install that Python version using: `uv python install X.Y`
-3. Create a venv using: `uv venv --python X.Y .venv`
+## Step 1: Find Python version requirement
+Use grep_search with pattern: "requires-python|python_requires"
+- This finds version in pyproject.toml (requires-python) or setup.cfg (python_requires)
+- Look at the version number (e.g., >=3.8 means use 3.8)
 
-## Available Tools:
-- read_file: Read file contents
+## Step 2: Run these commands (use the version you found, or 3.11 as default)
+```
+uv python install <VERSION>
+uv venv --python <VERSION>
+uv pip install pip --python .venv/bin/python
+```
+
+## Tools:
+- grep_search: Search for patterns like "requires-python" or "python_requires"
+- read_file: Read pyproject.toml, setup.py, setup.cfg
 - run_command: Execute shell commands
 
-## CRITICAL Rules:
-- Only read pyproject.toml, setup.py, or setup.cfg - no other files
-- If no Python version specified, use python3.11
-- DO NOT run `uv venv` more than once - if you see "Creating virtual environment at: .venv" in output, the venv is ALREADY CREATED
-- After venv is created successfully, you MUST stop immediately and respond with ONLY the text "ENV READY" - do not call any more tools
+## Rules:
+- FIRST use grep_search to find Python version
+- THEN run the 3 uv commands
+- Default to Python 3.11 if no version specified
+- Respond "ENV READY" when all commands succeed
+- Do NOT respond "ENV READY" if any command fails
 
-## Repository Files:
-{file_listing}
+## STOPPING CONDITION:
+- STOP immediately after the virtual environment is created and pip is installed successfully.
+- Once you see "Exit code: 0" for all 3 commands (uv python install, uv venv, uv pip install pip), respond with "ENV READY" and STOP.
+- Do NOT continue with any additional commands or file reading after the goal is achieved.
 """
 
-# System prompt for Phase 2: Dependency Installation
-DEPS_INSTALL_PROMPT = """You are an expert at installing Python dependencies.
+# System prompt for Phase 2: Dependency Installation  
+DEPS_INSTALL_PROMPT = """You are installing Python dependencies for a repository.
 
-## YOUR TASK: Install all dependencies for this repository.
+## TASK: Install all dependencies so the package can be tested.
 
-## Steps:
-1. Read README.md or INSTALL.md to understand installation steps
-2. Install using the venv's pip directly: `.venv/bin/pip install -e .`
-3. If there are additional requirements, install them too
+## Step 1: Install build dependencies (ALWAYS run this first)
+```
+.venv/bin/pip install "setuptools<70" wheel cython "numpy<2" extension_helpers setuptools_scm
+```
 
-## Available Tools:
-- read_file: Read file contents
+## Step 2: Install the package with test extras (try this first)
+```
+.venv/bin/pip install -e ".[test]" --no-build-isolation
+```
+If this fails, install package and test deps separately:
+```
+.venv/bin/pip install -e . --no-build-isolation
+```
+
+## Tools:
+- grep_search: Search for patterns like "test", "dependencies", "requirements"
+- read_file: Read README, pyproject.toml
 - run_command: Execute shell commands
 
-## CRITICAL Rules:
-- The venv is already created at .venv
-- ALWAYS use the venv's pip directly: `.venv/bin/pip install ...` (NOT `pip install`)
-- ALWAYS use the venv's python directly: `.venv/bin/python ...` (NOT `python`)
-- Do NOT use `. .venv/bin/activate` - it doesn't work in subprocesses
-- Do NOT read CONTRIBUTING.md
-- When installation is complete, stop and respond "DEPS INSTALLED"
+## Rules:
+- Run pip commands using .venv/bin/pip
+- Use --no-build-isolation to avoid setuptools compatibility issues
+- Try .[test] extras first, fall back to separate installs if needed
+- Respond "DEPS INSTALLED" when all commands succeed
+- Do NOT respond "DEPS INSTALLED" if any command fails
 
-## Repository Files:
-{file_listing}
+## STOPPING CONDITION:
+- STOP immediately after dependencies are installed successfully.
+- Once pip install commands complete with "Exit code: 0", respond with "DEPS INSTALLED" and STOP.
+- Do NOT continue with any additional commands, file reading, or exploration after the goal is achieved.
 """
 
 
 class SweVerifiedGreenAgent(GreenAgent):
     def __init__(self):
-        self._required_config_keys = ["base_commit", "hints_text", "problem_statement", "repo_url"]
+        self._required_config_keys = []  # Config values come from parquet file
         self._tool_provider = ToolProvider()
 
     def validate_request(self, request: EvalRequest) -> tuple[bool, str]:
@@ -135,51 +175,6 @@ class SweVerifiedGreenAgent(GreenAgent):
 
         return True, "ok"
 
-    def _read_file(self, repo_dir: str, file_path: str) -> str:
-        """Read file contents safely within repo directory."""
-        full_path = os.path.join(repo_dir, file_path)
-        # Security: prevent path traversal
-        if not os.path.realpath(full_path).startswith(os.path.realpath(repo_dir)):
-            return "Error: Invalid file path (path traversal detected)"
-        if not os.path.exists(full_path):
-            return f"Error: File not found: {file_path}"
-        if os.path.isdir(full_path):
-            return f"Error: {file_path} is a directory, not a file"
-        try:
-            with open(full_path, "r") as f:
-                content = f.read()
-                if len(content) > 50000:
-                    return content[:50000] + "\n\n... (file truncated, too large)"
-                return content
-        except Exception as e:
-            return f"Error reading file: {e}"
-
-    def _run_command(self, repo_dir: str, command: str) -> str:
-        """Execute command and return output."""
-        logger.info(f"Executing command: {command}")
-        try:
-            result = subprocess.run(
-                command,
-                shell=True,
-                cwd=repo_dir,
-                capture_output=True,
-                text=True,
-                timeout=300  # 5 min timeout
-            )
-            output = f"Exit code: {result.returncode}\n"
-            if result.stdout:
-                output += f"STDOUT:\n{result.stdout}\n"
-            if result.stderr:
-                output += f"STDERR:\n{result.stderr}\n"
-            # Limit output size
-            if len(output) > 10000:
-                output = output[:10000] + "\n\n... (output truncated)"
-            return output
-        except subprocess.TimeoutExpired:
-            return "Error: Command timed out after 5 minutes"
-        except Exception as e:
-            return f"Error executing command: {e}"
-
     async def _run_agentic_loop(self, repo_dir: str, system_prompt: str, user_message: str, 
                                   phase_name: str, updater: TaskUpdater, max_iterations: int = 10) -> None:
         """Run a focused agentic loop with the given prompt."""
@@ -188,9 +183,14 @@ class SweVerifiedGreenAgent(GreenAgent):
             {"role": "user", "content": user_message}
         ]
         
-        # Track completion state to detect when we should force-exit
-        venv_created = False
-        deps_installed = False
+        # State tracking for goal completion
+        state = {
+            "python_installed": False,
+            "venv_created": False,
+            "pip_installed": False,
+            "build_deps_installed": False,
+            "package_installed": False,
+        }
         
         for iteration in range(max_iterations):
             logger.info(f"[{phase_name}] === Iteration {iteration + 1}/{max_iterations} ===")
@@ -213,17 +213,19 @@ class SweVerifiedGreenAgent(GreenAgent):
             assistant_message = response.choices[0].message
             messages.append(assistant_message.model_dump())
             
+            # Check for completion keywords in LLM response
+            if assistant_message.content:
+                content_upper = assistant_message.content.upper()
+                if "ENV READY" in content_upper:
+                    logger.info(f"[{phase_name}] ✓ Goal achieved (ENV READY detected): {assistant_message.content}")
+                    break
+                if "DEPS INSTALLED" in content_upper:
+                    logger.info(f"[{phase_name}] ✓ Goal achieved (DEPS INSTALLED detected): {assistant_message.content}")
+                    break
+            
             # Check if there are tool calls
             if not assistant_message.tool_calls:
-                logger.info(f"[{phase_name}] ✓ Completed. Final message: {assistant_message.content}")
-                break
-            
-            # Check if we should force-exit based on completion state
-            if phase_name == "ENV_SETUP" and venv_created:
-                logger.info(f"[{phase_name}] ✓ Venv already created, forcing completion")
-                break
-            if phase_name == "DEPS_INSTALL" and deps_installed:
-                logger.info(f"[{phase_name}] ✓ Dependencies already installed, forcing completion")
+                logger.info(f"[{phase_name}] ✓ Completed (no more tool calls). Final message: {assistant_message.content}")
                 break
 
             # Execute each tool call
@@ -237,7 +239,7 @@ class SweVerifiedGreenAgent(GreenAgent):
                 if func_name == "read_file":
                     file_path = args.get("file_path", "")
                     logger.info(f"[{phase_name}] → Reading file: {file_path}")
-                    result = self._read_file(repo_dir, file_path)
+                    result = read_file(repo_dir, file_path)
                     await updater.update_status(
                         TaskState.working, 
                         new_agent_text_message(f"Reading: {file_path}")
@@ -247,12 +249,31 @@ class SweVerifiedGreenAgent(GreenAgent):
                 elif func_name == "run_command":
                     command = args.get("command", "")
                     logger.info(f"[{phase_name}] → Running command: {command}")
-                    result = self._run_command(repo_dir, command)
+                    result = run_command(repo_dir, command)
                     
-                    # Extract exit code for logging
+                    # Extract exit code for logging and state tracking
                     exit_code = "unknown"
                     if "Exit code: " in result:
                         exit_code = result.split("Exit code: ")[1].split("\n")[0]
+                    
+                    # Track successful commands for goal completion
+                    if exit_code == "0":
+                        cmd_lower = command.lower()
+                        if "uv python install" in cmd_lower:
+                            state["python_installed"] = True
+                            logger.info(f"[{phase_name}] ✓ State: python_installed = True")
+                        if "uv venv" in cmd_lower:
+                            state["venv_created"] = True
+                            logger.info(f"[{phase_name}] ✓ State: venv_created = True")
+                        if "pip install pip" in cmd_lower or "pip install --upgrade pip" in cmd_lower:
+                            state["pip_installed"] = True
+                            logger.info(f"[{phase_name}] ✓ State: pip_installed = True")
+                        if "pip install" in cmd_lower and ("setuptools" in cmd_lower or "wheel" in cmd_lower):
+                            state["build_deps_installed"] = True
+                            logger.info(f"[{phase_name}] ✓ State: build_deps_installed = True")
+                        if "pip install -e" in cmd_lower or "pip install ." in cmd_lower:
+                            state["package_installed"] = True
+                            logger.info(f"[{phase_name}] ✓ State: package_installed = True")
                     
                     await updater.update_status(
                         TaskState.working, 
@@ -260,13 +281,18 @@ class SweVerifiedGreenAgent(GreenAgent):
                     )
                     logger.info(f"[{phase_name}]   Command exit code: {exit_code}")
                     
-                    # Detect completion states
-                    if "uv venv" in command and "Creating virtual environment at: .venv" in result:
-                        venv_created = True
-                        logger.info(f"[{phase_name}] ✓ Detected: venv successfully created")
-                    if "pip install" in command and exit_code == "0":
-                        deps_installed = True
-                        logger.info(f"[{phase_name}] ✓ Detected: pip install succeeded")
+
+                
+                elif func_name == "grep_search":
+                    pattern = args.get("pattern", "")
+                    logger.info(f"[{phase_name}] → Searching for: {pattern}")
+                    result = grep_search(repo_dir, pattern)
+                    await updater.update_status(
+                        TaskState.working, 
+                        new_agent_text_message(f"Searching: {pattern}")
+                    )
+                    logger.info(f"[{phase_name}]   Search results: {len(result)} chars")
+                    
                 else:
                     result = f"Unknown tool: {func_name}"
                     logger.warning(f"[{phase_name}] Unknown tool: {func_name}")
@@ -277,51 +303,257 @@ class SweVerifiedGreenAgent(GreenAgent):
                     "tool_call_id": tool_call.id,
                     "content": result
                 })
+            
+            # Check for programmatic goal completion after processing all tool calls
+            if phase_name == "ENV_SETUP" and state["venv_created"] and state["pip_installed"]:
+                logger.info(f"[{phase_name}] ✓ Goal achieved programmatically (venv + pip installed)")
+                break
+            if phase_name == "DEPS_INSTALL" and state["package_installed"]:
+                logger.info(f"[{phase_name}] ✓ Goal achieved programmatically (package installed)")
+                break
         else:
             logger.warning(f"[{phase_name}] ⚠ Reached max iterations ({max_iterations})")
 
     async def _run_env_setup(self, repo_dir: str, file_listing: str, updater: TaskUpdater) -> None:
         """Phase 1: Identify Python version, install it, create venv."""
-        system_prompt = ENV_SETUP_PROMPT.format(file_listing=file_listing)
         await self._run_agentic_loop(
             repo_dir=repo_dir,
-            system_prompt=system_prompt,
-            user_message="Find the required Python version from config files, install it with uv, and create a .venv",
+            system_prompt=ENV_SETUP_PROMPT,
+            user_message=f"Repository files:\n{file_listing}",
             phase_name="ENV_SETUP",
             updater=updater,
             max_iterations=8
         )
 
     async def _run_deps_install(self, repo_dir: str, file_listing: str, updater: TaskUpdater) -> None:
-        """Phase 2: Read docs and install dependencies."""
-        system_prompt = DEPS_INSTALL_PROMPT.format(file_listing=file_listing)
+        """Phase 2: Install build deps, package, and test deps."""
         await self._run_agentic_loop(
             repo_dir=repo_dir,
-            system_prompt=system_prompt,
-            user_message="Read the installation docs and install all dependencies using pip install -e . (activate venv first)",
+            system_prompt=DEPS_INSTALL_PROMPT,
+            user_message=f"Repository files:\n{file_listing}",
             phase_name="DEPS_INSTALL",
             updater=updater,
             max_iterations=8
         )
 
+
+    async def _process_single_row(
+        self, 
+        row_idx: int, 
+        row: Any, 
+        total_rows: int, 
+        participant_url: str, 
+        updater: TaskUpdater,
+        semaphore: asyncio.Semaphore
+    ) -> dict:
+        """Process a single row/instance. Returns result dict."""
+        async with semaphore:
+            instance_id = row.get("instance_id", f"row_{row_idx}")
+            logger.info(f"=== Processing instance {row_idx + 1}/{total_rows}: {instance_id} ===")
+            await updater.update_status(TaskState.working, new_agent_text_message(f"Processing instance {row_idx + 1}/{total_rows}: {instance_id}"))
+            
+            try:
+                repo_url = row.get("repo", row.get("repo_url"))
+                if repo_url and not repo_url.startswith("http"):
+                    repo_url = f"https://github.com/{repo_url}"
+                    
+                base_commit = row["base_commit"]
+                environment_setup_commit = row.get("environment_setup_commit", base_commit)
+                hints_text = row["hints_text"]
+                problem_statement = row["problem_statement"]
+                fail_to_pass = json.loads(row["FAIL_TO_PASS"]) if isinstance(row["FAIL_TO_PASS"], str) else row["FAIL_TO_PASS"]
+                pass_to_pass = json.loads(row["PASS_TO_PASS"]) if isinstance(row["PASS_TO_PASS"], str) else row["PASS_TO_PASS"]
+                
+            except Exception as e:
+                logger.error(f"Failed to parse row {row_idx}: {e}")
+                return {"instance_id": instance_id, "error": str(e), "resolved": False}
+
+            temp_dir = tempfile.mkdtemp(prefix="agentbeats_repo_")
+            # Create a per-instance tool provider to avoid state conflicts
+            tool_provider = ToolProvider()
+            try:
+                # =============================================
+                # PHASE 1: Clone and checkout environment_setup_commit
+                # =============================================
+                await updater.update_status(TaskState.working, new_agent_text_message(f"[{instance_id}] Cloning repository {repo_url}..."))
+                
+                # Git clone
+                clone_result = subprocess.run(
+                    ["git", "clone", repo_url, temp_dir],
+                    capture_output=True,
+                    text=True
+                )
+                if clone_result.returncode != 0:
+                    raise Exception(f"Git clone failed: {clone_result.stderr}")
+                logger.info(f"Cloned repository to {temp_dir}")
+                
+                # Git checkout environment_setup_commit for environment setup
+                await updater.update_status(TaskState.working, new_agent_text_message(f"[{instance_id}] Checking out environment_setup_commit {environment_setup_commit[:8]}..."))
+                checkout_result = subprocess.run(
+                    ["git", "checkout", environment_setup_commit],
+                    cwd=temp_dir,
+                    capture_output=True,
+                    text=True
+                )
+                if checkout_result.returncode != 0:
+                    raise Exception(f"Git checkout failed: {checkout_result.stderr}")
+                logger.info(f"Checked out environment_setup_commit: {environment_setup_commit}")
+                
+                # List files (for agent context)
+                await updater.update_status(TaskState.working, new_agent_text_message(f"[{instance_id}] Listing repository files..."))
+                ls_result = subprocess.run(
+                    ["ls", "-la"],
+                    cwd=temp_dir,
+                    capture_output=True,
+                    text=True
+                )
+                file_listing = ls_result.stdout
+                logger.info(f"Repository files:\n{file_listing}")
+                
+                # =============================================
+                # PHASE 2A: Environment Setup (Python + venv)
+                # =============================================
+                await updater.update_status(TaskState.working, new_agent_text_message(f"[{instance_id}] Phase 1: Setting up Python environment..."))
+                await self._run_env_setup(temp_dir, file_listing, updater)
+                
+                # =============================================
+                # PHASE 2B: Dependency Installation
+                # =============================================
+                await updater.update_status(TaskState.working, new_agent_text_message(f"[{instance_id}] Phase 2: Installing dependencies..."))
+                await self._run_deps_install(temp_dir, file_listing, updater)
+                
+                # =============================================
+                # PHASE 3: Switch to base_commit for patch application
+                # =============================================
+                await updater.update_status(TaskState.working, new_agent_text_message(f"[{instance_id}] Switching to base_commit {base_commit[:8]}..."))
+                checkout_base_result = subprocess.run(
+                    ["git", "checkout", base_commit],
+                    cwd=temp_dir,
+                    capture_output=True,
+                    text=True
+                )
+                if checkout_base_result.returncode != 0:
+                    raise Exception(f"Git checkout to base_commit failed: {checkout_base_result.stderr}")
+                logger.info(f"Switched to base_commit: {base_commit}")
+                
+                # =============================================
+                # PHASE 4: Send problem to participant agent and wait for response
+                # =============================================
+                await updater.update_status(TaskState.working, new_agent_text_message(f"[{instance_id}] Sending problem to participant agent..."))
+                
+                # Send problem statement, hints, and repo dir - participant will use its own tools
+                message = f"REPO_DIR:{temp_dir}\n\nProblem Statement:\n{problem_statement}\n\nHints:\n{hints_text}"
+                
+                response = await tool_provider.talk_to_agent(message, participant_url, new_conversation=True)
+                
+                logger.info(f"Agent response: {response}")
+                await updater.update_status(TaskState.working, new_agent_text_message(f"[{instance_id}] Received response from participant. Extracting patch..."))
+                
+                # =============================================
+                # PHASE 5: Extract and apply patch
+                # =============================================
+                # First try regex-based extraction (faster)
+                patch_content = self._extract_patch(response)
+                
+                # If regex fails, use LLM to transform/extract the patch
+                if not patch_content:
+                    logger.info("Regex extraction failed, trying LLM transformation...")
+                    patch_content = await self._transform_to_patch_with_llm(response)
+                
+                patch_applied = False
+                
+                if patch_content:
+                    # Save patch to file
+                    patch_file = os.path.join(temp_dir, "proposed.patch")
+                    with open(patch_file, "w") as f:
+                        f.write(patch_content)
+                    
+                    # Apply patch using git apply
+                    await updater.update_status(TaskState.working, new_agent_text_message(f"[{instance_id}] Applying patch with 'git apply'..."))
+                    patch_result = subprocess.run(
+                        ["git", "apply", "proposed.patch"],
+                        cwd=temp_dir,
+                        capture_output=True,
+                        text=True
+                    )
+                    
+                    if patch_result.returncode == 0:
+                        patch_applied = True
+                        logger.info(f"Patch applied successfully:\n{patch_result.stdout}")
+                    else:
+                        logger.error(f"Patch failed to apply:\n{patch_result.stderr}")
+                        await updater.update_status(TaskState.working, new_agent_text_message(f"[{instance_id}] Patch failed to apply: {patch_result.stderr[:200]}"))
+                else:
+                    logger.warning("No patch found in agent response")
+                    await updater.update_status(TaskState.working, new_agent_text_message(f"[{instance_id}] No patch found in agent response"))
+
+                # =============================================
+                # PHASE 6: Run tests with venv activated
+                # =============================================
+                await updater.update_status(TaskState.working, new_agent_text_message(f"[{instance_id}] Running tests..."))
+                
+                # Run tests and collect results
+                fail_to_pass_results = {}
+                pass_to_pass_results = {}
+                
+                # Run FAIL_TO_PASS tests (these should now PASS after the fix)
+                for test in fail_to_pass:
+                    await updater.update_status(TaskState.working, new_agent_text_message(f"[{instance_id}] Running FAIL_TO_PASS test: {test[:50]}..."))
+                    cmd = f".venv/bin/python -m pytest {test} -v"
+                    result = subprocess.run(cmd, shell=True, cwd=temp_dir, capture_output=True, text=True)
+                    fail_to_pass_results[test] = result.returncode == 0
+                    logger.info(f"FAIL_TO_PASS test '{test}': {'PASSED' if result.returncode == 0 else 'FAILED'}")
+                
+                # Run PASS_TO_PASS tests (these should still PASS after the fix)
+                for test in pass_to_pass:
+                    await updater.update_status(TaskState.working, new_agent_text_message(f"[{instance_id}] Running PASS_TO_PASS test: {test[:50]}..."))
+                    cmd = f".venv/bin/python -m pytest {test} -v"
+                    result = subprocess.run(cmd, shell=True, cwd=temp_dir, capture_output=True, text=True)
+                    pass_to_pass_results[test] = result.returncode == 0
+                    logger.info(f"PASS_TO_PASS test '{test}': {'PASSED' if result.returncode == 0 else 'FAILED'}")
+
+                # =============================================
+                # PHASE 7: Calculate metrics for this instance
+                # =============================================
+                
+                fail_to_pass_total = len(fail_to_pass_results)
+                fail_to_pass_passed = sum(1 for v in fail_to_pass_results.values() if v)
+                
+                pass_to_pass_passed = sum(1 for v in pass_to_pass_results.values() if v)
+                pass_to_pass_total = len(pass_to_pass_results)
+                
+                # Resolution: patch applies + all fail_to_pass now pass + all pass_to_pass still pass
+                resolved = patch_applied and fail_to_pass_passed == fail_to_pass_total and pass_to_pass_passed == pass_to_pass_total
+                
+                instance_result = {
+                    "instance_id": instance_id,
+                    "resolved": resolved,
+                    "patch_applied": patch_applied,
+                    "fail_to_pass_passed": fail_to_pass_passed,
+                    "fail_to_pass_total": fail_to_pass_total,
+                    "pass_to_pass_passed": pass_to_pass_passed,
+                    "pass_to_pass_total": pass_to_pass_total,
+                }
+                
+                logger.info(f"[{instance_id}] Result: {'RESOLVED' if resolved else 'NOT RESOLVED'}")
+                return instance_result
+
+            except Exception as e:
+                logger.error(f"[{instance_id}] Error during execution: {e}")
+                return {"instance_id": instance_id, "error": str(e), "resolved": False}
+            finally:
+                shutil.rmtree(temp_dir)
+                tool_provider.reset()
+
     async def run_eval(self, req: EvalRequest, updater: TaskUpdater) -> None:
         logger.info(f"Starting SWE verified agent evaluation: {req}")
+        
+        # Configurable concurrency limit - read from config or default to 3
+        MAX_CONCURRENT_ROWS = int(req.config.get("max_concurrent_rows", 3))
         
         # Load data from parquet
         try:
             df = pd.read_parquet("data/test-00000-of-00001.parquet")
-            row = df.iloc[0]
-            
-            repo_url = row.get("repo", row.get("repo_url"))
-            if repo_url and not repo_url.startswith("http"):
-                repo_url = f"https://github.com/{repo_url}"
-                
-            base_commit = row["base_commit"]
-            hints_text = row["hints_text"]
-            problem_statement = row["problem_statement"]
-            fail_to_pass = json.loads(row["FAIL_TO_PASS"]) if isinstance(row["FAIL_TO_PASS"], str) else row["FAIL_TO_PASS"]
-            pass_to_pass = json.loads(row["PASS_TO_PASS"]) if isinstance(row["PASS_TO_PASS"], str) else row["PASS_TO_PASS"]
-            
         except Exception as e:
             logger.error(f"Failed to read from parquet: {e}")
             await updater.failed(new_agent_text_message(f"Failed to read data: {e}"))
@@ -329,212 +561,144 @@ class SweVerifiedGreenAgent(GreenAgent):
 
         participant_role = next(iter(req.participants))
         participant_url = str(req.participants[participant_role])
-
-        temp_dir = tempfile.mkdtemp(prefix="agentbeats_repo_")
-        try:
-            # =============================================
-            # PHASE 1: Fixed commands (always executed)
-            # =============================================
-            await updater.update_status(TaskState.working, new_agent_text_message(f"Cloning repository {repo_url}..."))
-            
-            # Git clone
-            clone_result = subprocess.run(
-                ["git", "clone", repo_url, temp_dir],
-                capture_output=True,
-                text=True
+        
+        total_rows = len(df)
+        logger.info(f"Processing {total_rows} rows with max {MAX_CONCURRENT_ROWS} concurrent workers")
+        
+        # Create semaphore to limit concurrent executions
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_ROWS)
+        
+        # Create tasks for all rows
+        tasks = [
+            self._process_single_row(
+                row_idx=row_idx,
+                row=row,
+                total_rows=total_rows,
+                participant_url=participant_url,
+                updater=updater,
+                semaphore=semaphore
             )
-            if clone_result.returncode != 0:
-                raise Exception(f"Git clone failed: {clone_result.stderr}")
-            logger.info(f"Cloned repository to {temp_dir}")
-            
-            # Git checkout base commit
-            await updater.update_status(TaskState.working, new_agent_text_message(f"Checking out commit {base_commit}..."))
-            checkout_result = subprocess.run(
-                ["git", "checkout", base_commit],
-                cwd=temp_dir,
-                capture_output=True,
-                text=True
-            )
-            if checkout_result.returncode != 0:
-                raise Exception(f"Git checkout failed: {checkout_result.stderr}")
-            logger.info(f"Checked out base commit: {base_commit}")
-            
-            # List files (for agent context)
-            await updater.update_status(TaskState.working, new_agent_text_message("Listing repository files..."))
-            ls_result = subprocess.run(
-                ["ls", "-la"],
-                cwd=temp_dir,
-                capture_output=True,
-                text=True
-            )
-            file_listing = ls_result.stdout
-            logger.info(f"Repository files:\n{file_listing}")
-            
-            # =============================================
-            # PHASE 2A: Environment Setup (Python + venv)
-            # =============================================
-            await updater.update_status(TaskState.working, new_agent_text_message("Phase 1: Setting up Python environment..."))
-            await self._run_env_setup(temp_dir, file_listing, updater)
-            
-            # =============================================
-            # PHASE 2B: Dependency Installation
-            # =============================================
-            await updater.update_status(TaskState.working, new_agent_text_message("Phase 2: Installing dependencies..."))
-            await self._run_deps_install(temp_dir, file_listing, updater)
-            
-            # =============================================
-            # PHASE 3: Send problem to participant agent
-            # =============================================
-            await updater.update_status(TaskState.working, new_agent_text_message("Sending problem to agent..."))
-            
-            # Send problem statement and hints
-            message = f"Problem Statement:\n{problem_statement}\n\nHints:\n{hints_text}"
-            
-            response = await self._tool_provider.talk_to_agent(message, participant_url, new_conversation=True)
-            
-            logger.info(f"Agent response: {response}")
-            await updater.update_status(TaskState.working, new_agent_text_message("Received patch from agent. Applying..."))
-            
-            # =============================================
-            # PHASE 4: Extract and apply patch
-            # =============================================
-            patch_content = self._extract_patch(response)
-            patch_applied = False
-            
-            if patch_content:
-                # Save patch to file
-                patch_file = os.path.join(temp_dir, "proposed.patch")
-                with open(patch_file, "w") as f:
-                    f.write(patch_content)
-                
-                # Apply patch using unix patch command
-                await updater.update_status(TaskState.working, new_agent_text_message("Applying patch with 'patch' command..."))
-                patch_result = subprocess.run(
-                    ["patch", "-p1", "-i", "proposed.patch"],
-                    cwd=temp_dir,
-                    capture_output=True,
-                    text=True
-                )
-                
-                if patch_result.returncode == 0:
-                    patch_applied = True
-                    logger.info(f"Patch applied successfully:\n{patch_result.stdout}")
-                else:
-                    logger.error(f"Patch failed to apply:\n{patch_result.stderr}")
-                    await updater.update_status(TaskState.working, new_agent_text_message(f"Patch failed to apply: {patch_result.stderr[:200]}"))
+            for row_idx, row in df.iterrows()
+        ]
+        
+        # Run all tasks concurrently (bounded by semaphore)
+        all_results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Handle any exceptions that were returned
+        processed_results = []
+        for i, result in enumerate(all_results):
+            if isinstance(result, Exception):
+                logger.error(f"Row {i} failed with exception: {result}")
+                processed_results.append({"instance_id": f"row_{i}", "error": str(result), "resolved": False})
             else:
-                logger.warning("No patch found in agent response")
-                await updater.update_status(TaskState.working, new_agent_text_message("No patch found in agent response"))
-
-            # =============================================
-            # PHASE 5: Run tests with venv activated
-            # =============================================
-            await updater.update_status(TaskState.working, new_agent_text_message("Running tests..."))
-            
-            # Get test commands from LLM
-            files = os.listdir(temp_dir)
-            files_str = "\n".join(files[:500])
-            test_prompt = f"""
-You are an expert software engineer.
-Given the following file list and test identifiers, provide the shell command(s) to run these specific tests.
-The virtual environment is at .venv, so activate it first.
-Return ONLY a JSON list of strings.
-
-Files:
-{files_str}
-
-Tests to run:
-FAIL_TO_PASS: {fail_to_pass}
-PASS_TO_PASS: {pass_to_pass}
+                processed_results.append(result)
+        
+        # Calculate totals
+        total_resolved = sum(1 for r in processed_results if r.get("resolved", False))
+        
+        # =============================================
+        # Final Summary
+        # =============================================
+        metrics_summary = f"""
+=== FINAL EVALUATION RESULTS ===
+Total Instances: {total_rows}
+Resolved: {total_resolved}/{total_rows} ({total_resolved/total_rows*100:.1f}%)
+Concurrency: {MAX_CONCURRENT_ROWS} parallel workers
+================================
 """
-            test_commands_json = await self._ask_llm(test_prompt)
-            try:
-                test_commands = json.loads(test_commands_json)
-                if isinstance(test_commands, str):
-                    test_commands = [test_commands]
-            except json.JSONDecodeError:
-                test_commands = [line.strip() for line in test_commands_json.split('\n') if line.strip() and not line.strip().startswith('```')]
+        logger.info(metrics_summary)
+        await updater.update_status(TaskState.working, new_agent_text_message(metrics_summary))
 
-            # Run tests and collect results
-            fail_to_pass_results = {}
-            pass_to_pass_results = {}
-            
-            # Run FAIL_TO_PASS tests (these should now PASS after the fix)
-            for test in fail_to_pass:
-                await updater.update_status(TaskState.working, new_agent_text_message(f"Running FAIL_TO_PASS test: {test[:50]}..."))
-                cmd = f".venv/bin/pytest {test} -v"
-                result = subprocess.run(cmd, shell=True, cwd=temp_dir, capture_output=True, text=True)
-                fail_to_pass_results[test] = result.returncode == 0
-                logger.info(f"FAIL_TO_PASS test '{test}': {'PASSED' if result.returncode == 0 else 'FAILED'}")
-            
-            # Run PASS_TO_PASS tests (these should still PASS after the fix)
-            for test in pass_to_pass:
-                await updater.update_status(TaskState.working, new_agent_text_message(f"Running PASS_TO_PASS test: {test[:50]}..."))
-                cmd = f".venv/bin/pytest {test} -v"
-                result = subprocess.run(cmd, shell=True, cwd=temp_dir, capture_output=True, text=True)
-                pass_to_pass_results[test] = result.returncode == 0
-                logger.info(f"PASS_TO_PASS test '{test}': {'PASSED' if result.returncode == 0 else 'FAILED'}")
-
-            # =============================================
-            # PHASE 6: Calculate metrics and report
-            # =============================================
-            fail_to_pass_passed = sum(1 for v in fail_to_pass_results.values() if v)
-            fail_to_pass_total = len(fail_to_pass_results)
-            fail_to_pass_pct = (fail_to_pass_passed / fail_to_pass_total * 100) if fail_to_pass_total > 0 else 0
-            
-            pass_to_pass_passed = sum(1 for v in pass_to_pass_results.values() if v)
-            pass_to_pass_total = len(pass_to_pass_results)
-            pass_to_pass_pct = (pass_to_pass_passed / pass_to_pass_total * 100) if pass_to_pass_total > 0 else 0
-            
-            # Resolution: patch applies + all fail_to_pass now pass + all pass_to_pass still pass
-            resolved = patch_applied and fail_to_pass_passed == fail_to_pass_total and pass_to_pass_passed == pass_to_pass_total
-            
-            metrics_summary = f"""
-=== EVALUATION RESULTS ===
-Patch Applied: {'YES' if patch_applied else 'NO'}
-
-FAIL_TO_PASS Tests (should now PASS):
-  Passed: {fail_to_pass_passed}/{fail_to_pass_total} ({fail_to_pass_pct:.1f}%)
-
-PASS_TO_PASS Tests (should still PASS):
-  Passed: {pass_to_pass_passed}/{pass_to_pass_total} ({pass_to_pass_pct:.1f}%)
-
-RESOLVED: {'YES' if resolved else 'NO'}
-=========================
-"""
-            logger.info(metrics_summary)
-            await updater.update_status(TaskState.working, new_agent_text_message(metrics_summary))
-
-            result = EvalResult(
-                winner=participant_role if resolved else "none",
-                detail={
-                    "response": response,
-                    "patch_applied": patch_applied,
-                    "fail_to_pass_passed": fail_to_pass_passed,
-                    "fail_to_pass_total": fail_to_pass_total,
-                    "fail_to_pass_pct": fail_to_pass_pct,
-                    "pass_to_pass_passed": pass_to_pass_passed,
-                    "pass_to_pass_total": pass_to_pass_total,
-                    "pass_to_pass_pct": pass_to_pass_pct,
-                    "resolved": resolved
-                }
-            )
-            await updater.add_artifact(
-                parts=[
-                    Part(root=TextPart(text=metrics_summary)),
-                    Part(root=TextPart(text=result.model_dump_json())),
-                ],
-                name="Result",
-            )
-
-        except Exception as e:
-            logger.error(f"Error during execution: {e}")
-            await updater.failed(new_agent_text_message(f"Error: {e}"))
-            raise e
-        finally:
-            shutil.rmtree(temp_dir)
-            self._tool_provider.reset()
+        result = EvalResult(
+            winner=participant_role if total_resolved > 0 else "none",
+            detail={
+                "total_instances": total_rows,
+                "total_resolved": total_resolved,
+                "resolution_rate": total_resolved / total_rows * 100 if total_rows > 0 else 0,
+                "results": processed_results
+            }
+        )
+        await updater.add_artifact(
+            parts=[
+                Part(root=TextPart(text=metrics_summary)),
+                Part(root=TextPart(text=result.model_dump_json())),
+            ],
+            name="Result",
+        )
     
+    async def _transform_to_patch_with_llm(self, response: str) -> str | None:
+        """Use LLM to transform code in the response into a proper unified diff patch.
+        
+        This is used when the response contains code blocks or suggestions but not
+        in proper patch format. The LLM will attempt to create a valid diff.
+        """
+        prompt = f"""You are a patch generation assistant. The following response contains code changes or suggestions that need to be converted into a proper git patch format.
+
+Your task is to analyze the response and generate a unified diff patch that can be applied using `git apply`.
+
+OUTPUT FORMAT - respond with a single patch wrapped in <patch> tags:
+<patch>
+--- a/path/to/file.py
++++ b/path/to/file.py
+@@ -1,10 +1,15 @@
+ unchanged line
+-removed line
++added line
+ unchanged line
+</patch>
+
+RULES:
+1. Identify the file path from the context (look for file mentions, function names, module imports)
+2. Create a proper unified diff with:
+   - `--- a/path/to/file` for original
+   - `+++ b/path/to/file` for modified
+   - `@@ -start,count +start,count @@` line number markers
+   - Lines starting with space (unchanged), - (removed), + (added)
+3. If the response shows a complete new function/code, assume it REPLACES existing code
+4. If you cannot determine the file path or changes, return: NO_PATCH_FOUND
+5. Do NOT include any explanation outside the <patch> tags
+
+RESPONSE TO TRANSFORM:
+{response}
+
+GENERATED PATCH:"""
+        
+        try:
+            result = await self._ask_llm(prompt)
+            result = result.strip()
+            
+            if result == "NO_PATCH_FOUND" or not result:
+                logger.warning("LLM could not transform response to patch")
+                return None
+            
+            # Extract content from <patch>...</patch> tags if present
+            if "<patch>" in result and "</patch>" in result:
+                start = result.find("<patch>") + len("<patch>")
+                end = result.find("</patch>")
+                result = result[start:end].strip()
+            
+            # Validate it looks like a patch
+            if "---" in result and "+++" in result:
+                # Clean up any trailing markdown artifacts (e.g., closing ```)
+                lines = result.split('\n')
+                cleaned_lines = []
+                for line in lines:
+                    # Stop if we hit a markdown code block delimiter
+                    if line.strip() == '```' or line.strip().startswith('```'):
+                        break
+                    cleaned_lines.append(line)
+                result = '\n'.join(cleaned_lines).strip()
+                
+                logger.info(f"LLM transformed response to patch: {len(result)} chars")
+                return result
+            else:
+                logger.warning("LLM transformation doesn't look like a valid patch")
+                return None
+                
+        except Exception as e:
+            logger.error(f"LLM patch transformation failed: {e}")
+            return None
+
     def _extract_patch(self, response: str) -> str | None:
         """Extract patch content from agent response."""
         # Look for <patch>...</patch> tags
@@ -622,10 +786,7 @@ async def main():
     "agent": "http://agent-url"
   },
   "config": {
-    "repo_url": "https://github.com/example/repo",
-    "base_commit": "main",
-    "hints_text": "Fix the bug",
-    "problem_statement": "The code crashes"
+    "max_concurrent_rows": 5
   }
 }
 """
