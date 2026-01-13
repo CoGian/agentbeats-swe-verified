@@ -27,8 +27,6 @@ from agentbeats.cloudflare import quick_tunnel
 from agentbeats.repo_tools import read_file, run_command, grep_search
 from loguru import logger
 
-load_dotenv()
-
 logging.basicConfig(level=logging.INFO)
 
 
@@ -496,7 +494,7 @@ class SweVerifiedGreenAgent(GreenAgent):
                     await updater.update_status(TaskState.working, new_agent_text_message(f"[{instance_id}] Running FAIL_TO_PASS test: {test[:50]}..."))
                     cmd = f".venv/bin/python -m pytest {test} -v"
                     result = subprocess.run(cmd, shell=True, cwd=temp_dir, capture_output=True, text=True)
-                    fail_to_pass_results[test] = result.returncode == 0
+                    fail_to_pass_results[test] = result.returncode == 1
                     logger.info(f"FAIL_TO_PASS test '{test}': {'PASSED' if result.returncode == 0 else 'FAILED'}")
                 
                 # Run PASS_TO_PASS tests (these should still PASS after the fix)
@@ -512,21 +510,21 @@ class SweVerifiedGreenAgent(GreenAgent):
                 # =============================================
                 
                 fail_to_pass_total = len(fail_to_pass_results)
-                fail_to_pass_passed = sum(1 for v in fail_to_pass_results.values() if v)
+                fail_to_pass_failed = sum(1 for v in fail_to_pass_results.values() if v)
                 
                 pass_to_pass_passed = sum(1 for v in pass_to_pass_results.values() if v)
                 pass_to_pass_total = len(pass_to_pass_results)
                 
-                # Resolution: patch applies + all fail_to_pass now pass + all pass_to_pass still pass
-                resolved = patch_applied and fail_to_pass_passed == fail_to_pass_total and pass_to_pass_passed == pass_to_pass_total
+                # Resolution: patch applies + all fail_to_pass fail + all pass_to_pass pass
+                resolved = patch_applied and fail_to_pass_failed == fail_to_pass_total and pass_to_pass_passed == pass_to_pass_total
                 
                 instance_result = {
                     "instance_id": instance_id,
                     "resolved": resolved,
                     "patch_applied": patch_applied,
-                    "fail_to_pass_passed": fail_to_pass_passed,
+                    "fail_to_pass_failed_pct": fail_to_pass_failed / fail_to_pass_total,
                     "fail_to_pass_total": fail_to_pass_total,
-                    "pass_to_pass_passed": pass_to_pass_passed,
+                    "pass_to_pass_passed_pct": pass_to_pass_passed / pass_to_pass_total,
                     "pass_to_pass_total": pass_to_pass_total,
                 }
                 
@@ -598,7 +596,8 @@ class SweVerifiedGreenAgent(GreenAgent):
         
         # Calculate totals
         total_resolved = sum(1 for r in processed_results if r.get("resolved", False))
-        
+        failed_to_pass_failed_rate = sum(r.get("fail_to_pass_failed_pct", 0) for r in processed_results) / total_rows
+        pass_to_pass_passed_rate = sum(r.get("pass_to_pass_passed_pct", 0) for r in processed_results) / total_rows
         # =============================================
         # Final Summary
         # =============================================
@@ -607,6 +606,8 @@ class SweVerifiedGreenAgent(GreenAgent):
 Total Instances: {total_rows}
 Resolved: {total_resolved}/{total_rows} ({total_resolved/total_rows*100:.1f}%)
 Concurrency: {MAX_CONCURRENT_ROWS} parallel workers
+Fail to Pass Failed: {failed_to_pass_failed_rate}
+Pass to Pass Passed: {pass_to_pass_passed_rate}
 ================================
 """
         logger.info(metrics_summary)
@@ -616,6 +617,8 @@ Concurrency: {MAX_CONCURRENT_ROWS} parallel workers
             total_instances=total_rows,
             total_resolved=total_resolved,
             resolution_rate=total_resolved / total_rows * 100 if total_rows > 0 else 0,
+            fail_to_pass_failed_rate=failed_to_pass_failed_rate,
+            pass_to_pass_passed_rate=pass_to_pass_passed_rate,
         )
         await updater.add_artifact(
             parts=[

@@ -52,21 +52,6 @@ source .venv/bin/activate  # On Linux/macOS
 pip install -e .
 ```
 
-## ⚙️ Configuration
-
-Create a `.env` file in the project root with your API keys and configuration:
-
-```env
-# LLM Provider Configuration
-OPENAI_API_KEY=your_openai_api_key
-# Or use other providers supported by LiteLLM
-ANTHROPIC_API_KEY=your_anthropic_api_key
-GEMINI_API_KEY=your_gemini_api_key
-
-# Optional: Custom LLM settings
-LLM_MODEL=gpt-4
-```
-
 ## 🦙 Ollama Setup
 
 This project uses Ollama for local LLM inference. Follow these steps to set up Ollama:
@@ -133,27 +118,21 @@ uv run swe_scenario/dummy_llm.py --host 127.0.0.1 --port 9021
 Pull the latest image from GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/cogian/agentbeats-swe-verified:v1.0
+docker pull ghcr.io/cogian/agentbeats-swe-verified:v1.1
+```
+
+OR 
+
+Build the image from source:
+```bash
+docker build -t ghcr.io/cogian/agentbeats-swe-verified:v1.1 .
 ```
 
 Run the container:
 
 ```bash
-# Run with GPU support
-docker run --gpus all -p 9020:9020 ghcr.io/cogian/agentbeats-swe-verified:v1.0
-
-# Run with environment variables from .env file
-docker run --gpus all --env-file .env -p 9020:9020 ghcr.io/cogian/agentbeats-swe-verified:v1.0
-```
-
-### Building Locally
-
-```bash
-# Build the image
-docker build -t agentbeats-swe-verified .
-
 # Run locally built image
-docker run --gpus all -p 9020:9020 agentbeats-swe-verified
+docker run --gpus all -p 9020:9020 ghcr.io/cogian/agentbeats-swe-verified:v1.1
 ```
 
 ## 📁 Project Structure
