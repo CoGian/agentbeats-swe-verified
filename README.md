@@ -138,7 +138,7 @@ docker build -t agentbeats-swe-verified .
 
 ```bash
 # Run with environment variables from .env file
-docker run --env-file .env -p 9020:9020 agentbeats-swe-verified
+docker run --gpus all --env-file .env -p 9020:9020 agentbeats-swe-verified
 ```
 
 ## 📁 Project Structure

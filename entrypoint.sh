@@ -12,6 +12,6 @@ until curl -s http://localhost:11434/api/tags > /dev/null 2>&1; do
 done
 echo "Ollama is ready!"
 
-# Run the green agent
+# Run the green agent (bind to 0.0.0.0 for Docker access)
 echo "Starting green agent..."
-exec uv run src/swe_green_agent/agent.py
+exec uv run src/swe_green_agent/agent.py --host 0.0.0.0 --port 9020
