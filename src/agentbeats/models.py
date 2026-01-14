@@ -16,3 +16,5 @@ class EvalResult(BaseModel):
     error_pct: float
     fail_to_pass_passed_pct: float
     pass_to_pass_passed_pct: float
+    green_agent_model: str
+    

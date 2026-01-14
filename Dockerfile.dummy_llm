@@ -1,0 +1,41 @@
+# AgentBeats SWE Verified - Dummy LLM Docker Image (No Ollama)
+# This Dockerfile runs the dummy LLM agent using API-based models (e.g., Gemini, OpenAI)
+
+FROM python:3.13-slim
+
+# Install dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:$PATH"
+
+# Set working directory
+WORKDIR /app
+
+# Copy application code
+COPY . .
+
+# Install Python dependencies
+RUN uv sync
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# Create directory for data
+RUN mkdir -p /app/data
+
+# Expose port for dummy LLM agent
+EXPOSE 9021
+
+# Default LLM model (can be set at build time with --build-arg or overridden at runtime with -e)
+ARG LLM_MODEL="gemini/gemini-2.5-flash-lite"
+ENV LLM_MODEL=${LLM_MODEL}
+
+# Default command: Run the dummy LLM agent
+# Environment variables like GEMINI_API_KEY or OPENAI_API_KEY must be passed at runtime
+CMD uv run src/swe_purple_agent/dummy_llm.py --host 0.0.0.0 --port 9021 --model $LLM_MODEL

@@ -184,6 +184,30 @@ Run the container:
 docker run --gpus all -p 9020:9020 ghcr.io/cogian/agentbeats-swe-verified:v1.1
 ```
 
+### Purple Dummy Agent (No Ollama)
+
+A lightweight Docker image for running the purple dummy agent using Gemini API (no Ollama required).
+
+**Build:**
+```bash
+docker build -f Dockerfile.dummy_llm -t ghcr.io/cogian/agentbeats-swe-verified-dummy-gemini-2.5-flash-lite .
+```
+
+**Push:**
+```bash
+docker push ghcr.io/cogian/agentbeats-swe-verified-dummy-gemini-2.5-flash-lite
+```
+
+**Run:**
+```bash
+docker run -p 9021:9021 -e GEMINI_API_KEY=your-api-key ghcr.io/cogian/agentbeats-swe-verified-dummy-gemini-2.5-flash-lite
+```
+
+You can override the model at runtime:
+```bash
+docker run -p 9021:9021 -e LLM_MODEL=gemini/gemini-2.0-flash -e GEMINI_API_KEY=your-key ghcr.io/cogian/agentbeats-swe-verified-dummy-gemini-2.5-flash-lite
+```
+
 ## 📁 Project Structure
 
 ```

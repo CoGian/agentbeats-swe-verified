@@ -654,6 +654,7 @@ Pass to Pass Passed: {pass_to_pass_passed_pct*100:.1f}%
             error_pct=error_pct,
             fail_to_pass_passed_pct=failed_to_pass_passed_pct,
             pass_to_pass_passed_pct=pass_to_pass_passed_pct,
+            green_agent_model=self._model
         )
         await updater.add_artifact(
             parts=[
