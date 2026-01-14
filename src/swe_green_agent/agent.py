@@ -16,7 +16,7 @@ import uvicorn
 from a2a.server.apps import A2AStarletteApplication
 from a2a.server.request_handlers import DefaultRequestHandler
 from a2a.server.tasks import InMemoryTaskStore, TaskUpdater
-from a2a.types import AgentCard, TaskState, Part, TextPart, AgentCapabilities, AgentSkill
+from a2a.types import AgentCard, TaskState, Part, TextPart, AgentCapabilities, AgentSkill, DataPart
 from a2a.utils import new_agent_text_message
 from dotenv import load_dotenv
 
@@ -658,7 +658,7 @@ Pass to Pass Passed: {pass_to_pass_passed_pct*100:.1f}%
         await updater.add_artifact(
             parts=[
                 Part(root=TextPart(text=metrics_summary)),
-                Part(root=TextPart(text=result.model_dump_json())),
+                Part(root=DataPart(data=result.model_dump())),
             ],
             name="Result",
         )
