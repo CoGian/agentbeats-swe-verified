@@ -25,15 +25,14 @@ COPY . .
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 
+RUN uv sync
+
 # Create the Ollama model during build
 RUN ollama serve & \
     sleep 5 && \
     ollama create qwen2.5-coder:7b -f /app/qwen2_5_coder_7b.ollamaModelFile
 # Create directory for data
 RUN mkdir -p /app/data
-
-# Make entrypoint script executable
-RUN chmod +x /app/entrypoint.sh
 
 # Expose ports for green agent and Ollama
 EXPOSE 9020
@@ -43,4 +42,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD python -c "import httpx; httpx.get('http://localhost:9020/.well-known/agent.json')" || exit 1
 
 # Default command: Run entrypoint (starts Ollama + green agent)
-CMD ["/app/entrypoint.sh"]
+CMD uv run src/swe_green_agent/agent.py --host 0.0.0.0 --port 9020
