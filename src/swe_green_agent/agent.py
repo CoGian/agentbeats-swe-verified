@@ -494,7 +494,7 @@ class SweVerifiedGreenAgent(GreenAgent):
                     await updater.update_status(TaskState.working, new_agent_text_message(f"[{instance_id}] Running FAIL_TO_PASS test: {test[:50]}..."))
                     cmd = f".venv/bin/python -m pytest {test} -v"
                     result = subprocess.run(cmd, shell=True, cwd=temp_dir, capture_output=True, text=True)
-                    fail_to_pass_results[test] = result.returncode == 1
+                    fail_to_pass_results[test] = result.returncode == 0
                     logger.info(f"FAIL_TO_PASS test '{test}': {'PASSED' if result.returncode == 0 else 'FAILED'}")
                 
                 # Run PASS_TO_PASS tests (these should still PASS after the fix)
@@ -510,30 +510,49 @@ class SweVerifiedGreenAgent(GreenAgent):
                 # =============================================
                 
                 fail_to_pass_total = len(fail_to_pass_results)
-                fail_to_pass_failed = sum(1 for v in fail_to_pass_results.values() if v)
+                fail_to_pass_passed = sum(1 for v in fail_to_pass_results.values() if v)
                 
                 pass_to_pass_passed = sum(1 for v in pass_to_pass_results.values() if v)
                 pass_to_pass_total = len(pass_to_pass_results)
                 
-                # Resolution: patch applies + all fail_to_pass fail + all pass_to_pass pass
-                resolved = patch_applied and fail_to_pass_failed == fail_to_pass_total and pass_to_pass_passed == pass_to_pass_total
+                # Resolution: patch applies + all fail_to_pass pass + all pass_to_pass pass
+                if not patch_applied:
+                    status = "no_op"
+                # 1. Check if EVERYTHING passed
+                elif fail_to_pass_passed == fail_to_pass_total and pass_to_pass_passed == pass_to_pass_total:
+                    status = "resolved"
+                # 2. Check if all F2P fixed (but P2P must be broken, otherwise #1 would have triggered)
+                elif fail_to_pass_passed == fail_to_pass_total:
+                    status = "breaking_resolved"
+                # 3. Check if P2P is perfect (Handle Partial vs None here)
+                elif pass_to_pass_passed == pass_to_pass_total:
+                    if fail_to_pass_passed > 0:
+                        status = "partially_resolved"
+                    else:
+                        status = "no_op"
+                # 4. If we are here, P2P is broken (Partial/None) AND F2P is not All
+                elif fail_to_pass_passed > 0:
+                    status = "work_in_progress"
+                # 5. Final fallback: P2P Broken + F2P None
+                else:
+                    status = "regression"
                 
                 instance_result = {
                     "instance_id": instance_id,
-                    "resolved": resolved,
+                    "status": status,
                     "patch_applied": patch_applied,
-                    "fail_to_pass_failed_pct": fail_to_pass_failed / fail_to_pass_total,
-                    "fail_to_pass_total": fail_to_pass_total,
+                    "fail_to_pass_passed_pct": fail_to_pass_passed / fail_to_pass_total,
+                    "fail_to_pass_total": fail_to_pass_total,   
                     "pass_to_pass_passed_pct": pass_to_pass_passed / pass_to_pass_total,
                     "pass_to_pass_total": pass_to_pass_total,
                 }
                 
-                logger.info(f"[{instance_id}] Result: {'RESOLVED' if resolved else 'NOT RESOLVED'}")
+                logger.info(f"[{instance_id}] Status: {status}")
                 return instance_result
 
             except Exception as e:
                 logger.error(f"[{instance_id}] Error during execution: {e}")
-                return {"instance_id": instance_id, "error": str(e), "resolved": False}
+                return {"instance_id": instance_id, "error": str(e), "status": "error"}
             finally:
                 shutil.rmtree(temp_dir)
                 tool_provider.reset()
@@ -590,35 +609,51 @@ class SweVerifiedGreenAgent(GreenAgent):
         for i, result in enumerate(all_results):
             if isinstance(result, Exception):
                 logger.error(f"Row {i} failed with exception: {result}")
-                processed_results.append({"instance_id": f"row_{i}", "error": str(result), "resolved": False})
+                processed_results.append({"instance_id": f"row_{i}", "error": str(result), "status": "error"})
             else:
                 processed_results.append(result)
         
         # Calculate totals
-        total_resolved = sum(1 for r in processed_results if r.get("resolved", False))
-        failed_to_pass_failed_rate = sum(r.get("fail_to_pass_failed_pct", 0) for r in processed_results) / total_rows
-        pass_to_pass_passed_rate = sum(r.get("pass_to_pass_passed_pct", 0) for r in processed_results) / total_rows
+        resolved_pct = sum(1 for r in processed_results if r.get("status", "") == "resolved") / total_rows
+        breaking_resolved_pct = sum(1 for r in processed_results if r.get("status", "") == "breaking_resolved") / total_rows
+        partially_resolved_pct = sum(1 for r in processed_results if r.get("status", "") == "partially_resolved") / total_rows
+        work_in_progress_pct = sum(1 for r in processed_results if r.get("status", "") == "work_in_progress") / total_rows
+        regression_pct = sum(1 for r in processed_results if r.get("status", "") == "regression") / total_rows
+        no_op_pct = sum(1 for r in processed_results if r.get("status", "") == "no_op") / total_rows
+        error_pct = sum(1 for r in processed_results if r.get("status", "") == "error") / total_rows
+        failed_to_pass_passed_pct = sum(r.get("fail_to_pass_passed_pct", 0) for r in processed_results) / total_rows
+        pass_to_pass_passed_pct = sum(r.get("pass_to_pass_passed_pct", 0) for r in processed_results) / total_rows
         # =============================================
         # Final Summary
         # =============================================
         metrics_summary = f"""
 === FINAL EVALUATION RESULTS ===
 Total Instances: {total_rows}
-Resolved: {total_resolved}/{total_rows} ({total_resolved/total_rows*100:.1f}%)
-Concurrency: {MAX_CONCURRENT_ROWS} parallel workers
-Fail to Pass Failed: {failed_to_pass_failed_rate}
-Pass to Pass Passed: {pass_to_pass_passed_rate}
+Resolved: {resolved_pct*100:.1f}%
+Breaking Resolved: {breaking_resolved_pct*100:.1f}%
+Partially Resolved: {partially_resolved_pct*100:.1f}%
+Work In Progress: {work_in_progress_pct*100:.1f}%
+Regression: {regression_pct*100:.1f}%
+No Op: {no_op_pct*100:.1f}%
+Error: {error_pct*100:.1f}%
+Fail to Pass Passed: {failed_to_pass_passed_pct*100:.1f}%
+Pass to Pass Passed: {pass_to_pass_passed_pct*100:.1f}%
 ================================
 """
         logger.info(metrics_summary)
         await updater.update_status(TaskState.working, new_agent_text_message(metrics_summary))
 
-        result = EvalResult(
+        result = EvalResult(    
             total_instances=total_rows,
-            total_resolved=total_resolved,
-            resolution_rate=total_resolved / total_rows * 100 if total_rows > 0 else 0,
-            fail_to_pass_failed_rate=failed_to_pass_failed_rate,
-            pass_to_pass_passed_rate=pass_to_pass_passed_rate,
+            resolved_pct=resolved_pct,
+            breaking_resolved_pct=breaking_resolved_pct,
+            partially_resolved_pct=partially_resolved_pct,
+            work_in_progress_pct=work_in_progress_pct,
+            regression_pct=regression_pct,
+            no_op_pct=no_op_pct,
+            error_pct=error_pct,
+            fail_to_pass_passed_pct=failed_to_pass_passed_pct,
+            pass_to_pass_passed_pct=pass_to_pass_passed_pct,
         )
         await updater.add_artifact(
             parts=[
