@@ -160,7 +160,7 @@ def run_command(command: str, tool_context=None) -> str:
 def main():
     parser = argparse.ArgumentParser(description="Run the Dummy LLM agent.")
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Host to bind the server")
-    parser.add_argument("--port", type=int, default=9021, help="Port to bind the server")
+    parser.add_argument("--port", type=int, default=9009, help="Port to bind the server")
     parser.add_argument("--card-url", type=str, help="External URL to provide in the agent card")
     parser.add_argument("--model", type=str, help="LLM model to use")
     args = parser.parse_args()

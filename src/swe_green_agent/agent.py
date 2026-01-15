@@ -857,7 +857,7 @@ GENERATED PATCH:"""
 async def main():
     parser = argparse.ArgumentParser(description="Run the Repo Green Agent.")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to bind the server")
-    parser.add_argument("--port", type=int, default=9020, help="Port to bind the server")
+    parser.add_argument("--port", type=int, default=9009, help="Port to bind the server")
     parser.add_argument("--card-url", type=str, help="External URL to provide in the agent card")
     parser.add_argument("--cloudflare-quick-tunnel", action="store_true", help="Use a Cloudflare quick tunnel. Requires cloudflared. This will override --card-url")
     args = parser.parse_args()

@@ -34,12 +34,7 @@ RUN ollama serve & \
 # Create directory for data
 RUN mkdir -p /app/data
 
-# Expose ports for green agent and Ollama
-EXPOSE 9020
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD python -c "import httpx; httpx.get('http://localhost:9020/.well-known/agent.json')" || exit 1
-
 # Default command: Run entrypoint (starts Ollama + green agent)
-CMD uv run src/swe_green_agent/agent.py --host 0.0.0.0 --port 9020
+ENTRYPOINT ["uv", "run", "src/swe_green_agent/agent.py"]
+CMD ["--host", "0.0.0.0"]
+EXPOSE 9009

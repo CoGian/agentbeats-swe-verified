@@ -167,21 +167,21 @@ uv run swe_scenario/dummy_llm.py --host 127.0.0.1 --port 9021
 Pull the latest image from GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/cogian/agentbeats-swe-verified:v1.1
+docker pull ghcr.io/cogian/agentbeats-swe-verified:v1.3
 ```
 
 OR 
 
 Build the image from source:
 ```bash
-docker build -t ghcr.io/cogian/agentbeats-swe-verified:v1.1 .
+docker build -t ghcr.io/cogian/agentbeats-swe-verified:v1.3 .
 ```
 
 Run the container:
 
 ```bash
 # Run locally built image
-docker run --gpus all -p 9020:9020 ghcr.io/cogian/agentbeats-swe-verified:v1.1
+docker run --gpus all -p 9020:9009 ghcr.io/cogian/agentbeats-swe-verified:v1.3
 ```
 
 ### Purple Dummy Agent (No Ollama)
@@ -200,12 +200,12 @@ docker push ghcr.io/cogian/agentbeats-swe-verified-dummy-gemini-2.5-flash-lite
 
 **Run:**
 ```bash
-docker run -p 9021:9021 -e GEMINI_API_KEY=your-api-key ghcr.io/cogian/agentbeats-swe-verified-dummy-gemini-2.5-flash-lite
+docker run -p 9021:9009 -e GEMINI_API_KEY=your-api-key ghcr.io/cogian/agentbeats-swe-verified-dummy-gemini-2.5-flash-lite
 ```
 
 You can override the model at runtime:
 ```bash
-docker run -p 9021:9021 -e LLM_MODEL=gemini/gemini-2.0-flash -e GEMINI_API_KEY=your-key ghcr.io/cogian/agentbeats-swe-verified-dummy-gemini-2.5-flash-lite
+docker run -p 9021:9009 -e LLM_MODEL=gemini/gemini-2.0-flash -e GEMINI_API_KEY=your-key ghcr.io/cogian/agentbeats-swe-verified-dummy-gemini-2.5-flash-lite
 ```
 
 ## 📁 Project Structure
