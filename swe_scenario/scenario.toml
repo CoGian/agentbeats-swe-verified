@@ -1,12 +1,13 @@
 [green_agent]
-endpoint = "http://0.0.0.0:9009"
+endpoint = "http://127.0.0.1:9009"
 cmd = "python src/swe_green_agent/agent.py --host 127.0.0.1 --port 9009"
+env = { GEMINI_API_KEY = ""}
 
 [[participants]]
 role = "agent"
 endpoint = "http://127.0.0.1:9021"
-cmd = "python src/swe_purple_agent/dummy_llm.py --host 127.0.0.1 --port 9021 --model gemini/gemini-2.0-flash-exp"
-env = { GEMINI_API_KEY = "your-api-key"}
+cmd = "python src/swe_purple_agent/dummy_llm.py --host 127.0.0.1 --port 9021 --model gemini/gemini-2.5-flash"
+env = { GEMINI_API_KEY = ""}
 
 
 [config]
@@ -15,4 +16,4 @@ max_concurrent_rows = 1  # Number of dataset rows to process in parallel
 max_rows = 1  # Number of dataset rows to process (-1 for all rows)
 
 # Model configuration
-green_agent_model = "ollama/qwen2.5-coder:7b"  # Model used by the green agent
+green_agent_model = "gemini/gemini-2.5-flash"  # Model used by the green agent
