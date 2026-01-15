@@ -162,7 +162,7 @@ def main():
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Host to bind the server")
     parser.add_argument("--port", type=int, default=9009, help="Port to bind the server")
     parser.add_argument("--card-url", type=str, help="External URL to provide in the agent card")
-    parser.add_argument("--model", type=str, help="LLM model to use")
+    parser.add_argument("--model", type=str, help="LLM model to use", default="gemini/gemini-2.5-flash-lite")
     args = parser.parse_args()
     
     ollama_api_base = os.getenv("OLLAMA_API_BASE", "http://localhost:11434")

@@ -37,4 +37,5 @@ ENV LLM_MODEL=${LLM_MODEL}
 # Environment variables like GEMINI_API_KEY or OPENAI_API_KEY must be passed at runtime
 ENTRYPOINT ["uv", "run", "src/swe_purple_agent/dummy_llm.py"]
 CMD ["--host", "0.0.0.0", "--model", "$LLM_MODEL"]
+
 EXPOSE 9009
