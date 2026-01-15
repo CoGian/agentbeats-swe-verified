@@ -4,6 +4,16 @@ import uvicorn
 from dotenv import load_dotenv
 load_dotenv()
 
+from loguru import logger
+
+# Configure loguru for detailed output
+logger.add(
+    lambda msg: print(msg, end=""),
+    format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
+    level="DEBUG",
+    colorize=True
+)
+
 from google.adk.models.lite_llm import LiteLlm
 from google.adk.agents import Agent
 from google.adk.tools import FunctionTool
@@ -34,9 +44,9 @@ def euclidean(a, b):
 
 
 def bresenham(x0, y0, x1, y1):
-points = []
-dx = abs(x1 - x0)
-dy = abs(y1 - y0)
+ points = []
+ dx = abs(x1 - x0)
+ dy = abs(y1 - y0)
 - sx = 1 if x0 < x1 else -1
 - sy = 1 if y0 < y1 else -1
 - err = dx - dy
@@ -77,21 +87,55 @@ err -= dy
 return points
 </patch>
 
-You have access to tools to read files and run commands in the repository to help you understand the codebase and solve the issue.
+## AVAILABLE TOOLS
 
-IMPORTANT: The first line of the message will contain the repository directory in the format: REPO_DIR:/path/to/repo
-You MUST extract this path and use it with the tools.
+You have the following tools available to help you understand the codebase and solve the issue:
+
+### 1. read_file(file_path: str)
+Read the contents of a file in the repository.
+- **file_path**: Path RELATIVE to the repository root (e.g., 'README.md', 'src/main.py', 'tests/test_utils.py')
+- Example: To read the file at /repo/src/utils.py, use: read_file(file_path="src/utils.py")
+
+### 2. grep_search(pattern: str)
+Search for a pattern across all files in the repository using grep.
+- **pattern**: The search pattern (supports extended regex)
+- Example: To find all usages of a function: grep_search(pattern="my_function")
+- Example: To find class definitions: grep_search(pattern="class MyClass")
+
+### 3. run_command(command: str)
+Execute a shell command in the repository directory.
+- **command**: The shell command to execute
+- Example: To list files: run_command(command="ls -la")
+- Example: To run tests: run_command(command="python -m pytest tests/")
+
+## WORKFLOW
+
+1. First, understand the issue by reading relevant files
+2. Use grep_search to find related code patterns
+3. Use read_file to examine specific files in detail
+4. Generate a patch file that fixes the issue
+
+## IMPORTANT NOTES
+
+- The first line of the message contains REPO_DIR:/path/to/repo - this is handled automatically by the tools
+- Always use RELATIVE paths with read_file (e.g., 'src/main.py' NOT '/full/path/to/repo/src/main.py')
+- When you have enough information, generate the patch inside <patch>...</patch> tags
 """
 
 
 def _parse_repo_dir_from_context(context) -> str:
     """Extract REPO_DIR from the conversation context."""
+    logger.debug("Parsing REPO_DIR from context...")
+    logger.debug(f"Context type: {type(context)}")
+    
     # Try to get repo dir from the events in the session
     if hasattr(context, 'session'):
         session = context.session
+        logger.debug(f"Session found: {type(session)}")
         # Check for events (ADK session structure)
         events = getattr(session, 'events', None) or getattr(session, 'history', None) or []
-        for event in events:
+        logger.debug(f"Found {len(events)} events in session")
+        for i, event in enumerate(events):
             content = getattr(event, 'content', None)
             if content:
                 parts = getattr(content, 'parts', None)
@@ -102,14 +146,21 @@ def _parse_repo_dir_from_context(context) -> str:
                             # Find the line containing REPO_DIR
                             for line in text.split('\n'):
                                 if line.startswith("REPO_DIR:"):
-                                    return line.replace("REPO_DIR:", "").strip()
+                                    repo_dir = line.replace("REPO_DIR:", "").strip()
+                                    logger.info(f"Found REPO_DIR: {repo_dir}")
+                                    return repo_dir
     else:
         # Content is a plain string
-        text = str(content)
+        logger.debug("No session found, trying to parse context as string")
+        text = str(context)
         if "REPO_DIR:" in text:
             for line in text.split('\n'):
                 if line.startswith("REPO_DIR:"):
-                    return line.replace("REPO_DIR:", "").strip()
+                    repo_dir = line.replace("REPO_DIR:", "").strip()
+                    logger.info(f"Found REPO_DIR: {repo_dir}")
+                    return repo_dir
+    
+    logger.error("REPO_DIR not found in message context")
     raise ValueError("REPO_DIR not found in message context. Expected format: REPO_DIR:/path/to/repo")
 
 
@@ -124,8 +175,17 @@ def read_file(file_path: str, tool_context=None) -> str:
     Returns:
         The file contents as a string, or an error message if the file cannot be read.
     """
-    repo_dir = _parse_repo_dir_from_context(tool_context)
-    return _read_file(repo_dir, file_path)
+    logger.info(f"[TOOL CALL] read_file(file_path='{file_path}')")
+    try:
+        repo_dir = _parse_repo_dir_from_context(tool_context)
+        logger.debug(f"  -> Using REPO_DIR: {repo_dir}")
+        result = _read_file(repo_dir, file_path)
+        logger.debug(f"  -> Result length: {len(result)} chars")
+        logger.info(f"[TOOL RESULT] read_file completed successfully")
+        return result
+    except Exception as e:
+        logger.error(f"[TOOL ERROR] read_file failed: {e}")
+        raise
 
 
 def grep_search(pattern: str, tool_context=None) -> str:
@@ -138,8 +198,17 @@ def grep_search(pattern: str, tool_context=None) -> str:
     Returns:
         Search results with file paths and line numbers, or error message.
     """
-    repo_dir = _parse_repo_dir_from_context(tool_context)
-    return _grep_search(repo_dir, pattern)
+    logger.info(f"[TOOL CALL] grep_search(pattern='{pattern}')")
+    try:
+        repo_dir = _parse_repo_dir_from_context(tool_context)
+        logger.debug(f"  -> Using REPO_DIR: {repo_dir}")
+        result = _grep_search(repo_dir, pattern)
+        logger.debug(f"  -> Result length: {len(result)} chars")
+        logger.info(f"[TOOL RESULT] grep_search completed successfully")
+        return result
+    except Exception as e:
+        logger.error(f"[TOOL ERROR] grep_search failed: {e}")
+        raise
 
 
 def run_command(command: str, tool_context=None) -> str:
@@ -152,8 +221,17 @@ def run_command(command: str, tool_context=None) -> str:
     Returns:
         Command output including stdout, stderr, and exit code.
     """
-    repo_dir = _parse_repo_dir_from_context(tool_context)
-    return _run_command(repo_dir, command)
+    logger.info(f"[TOOL CALL] run_command(command='{command}')")
+    try:
+        repo_dir = _parse_repo_dir_from_context(tool_context)
+        logger.debug(f"  -> Using REPO_DIR: {repo_dir}")
+        result = _run_command(repo_dir, command)
+        logger.debug(f"  -> Result length: {len(result)} chars")
+        logger.info(f"[TOOL RESULT] run_command completed successfully")
+        return result
+    except Exception as e:
+        logger.error(f"[TOOL ERROR] run_command failed: {e}")
+        raise
 
 
 
@@ -162,7 +240,7 @@ def main():
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Host to bind the server")
     parser.add_argument("--port", type=int, default=9009, help="Port to bind the server")
     parser.add_argument("--card-url", type=str, help="External URL to provide in the agent card")
-    parser.add_argument("--model", type=str, help="LLM model to use", default="gemini/gemini-2.5-flash-lite")
+    parser.add_argument("--model", type=str, help="LLM model to use", default="gemini/gemini-2.5-flash")
     args = parser.parse_args()
     
     ollama_api_base = os.getenv("OLLAMA_API_BASE", "http://localhost:11434")

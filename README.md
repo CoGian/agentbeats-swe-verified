@@ -157,7 +157,7 @@ You can also run agents individually:
 uv run src/swe_green_agent/agent.py
 
 # Start a participant agent (dummy LLM for testing)
-uv run swe_scenario/dummy_llm.py --host 127.0.0.1 --port 9021
+uv run src/swe_purple_agent/dummy_llm.py --host 127.0.0.1 --port 9021
 ```
 
 ## 🐳 Docker

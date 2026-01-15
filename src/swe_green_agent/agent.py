@@ -370,7 +370,9 @@ class SweVerifiedGreenAgent(GreenAgent):
                 logger.error(f"Failed to parse row {row_idx}: {e}")
                 return {"instance_id": instance_id, "error": str(e), "resolved": False}
 
-            temp_dir = tempfile.mkdtemp(prefix="agentbeats_repo_")
+            # Clone to /repos/ directory instead of /tmp
+            os.makedirs("/repos", exist_ok=True)
+            temp_dir = tempfile.mkdtemp(prefix="agentbeats_repo_", dir="/repos")
             # Create a per-instance tool provider to avoid state conflicts
             tool_provider = ToolProvider()
             try:
