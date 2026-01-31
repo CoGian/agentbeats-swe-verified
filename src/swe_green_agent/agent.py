@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import json
+import re
 from typing import Any
 
 import pandas as pd
@@ -120,17 +121,54 @@ uv pip install pip --python .venv/bin/python
 - Do NOT continue with any additional commands or file reading after the goal is achieved.
 """
 
+# System prompt for finding Python version only (limited agentic loop)
+FIND_PYTHON_VERSION_PROMPT = """You are analyzing a Python repository to find the required Python version.
+
+## TASK: Find the Python version requirement and report it.
+
+## Strategy:
+1. Use grep_search to find version requirements:
+   - Pattern: "requires-python|python_requires"
+   - This searches pyproject.toml, setup.cfg, setup.py
+
+2. If grep doesn't find it, read these files:
+   - pyproject.toml (look for requires-python)
+   - setup.cfg (look for python_requires) 
+   - setup.py (look for python_requires)
+
+3. Parse the version from patterns like:
+   - requires-python = ">=3.8"  → use 3.8
+   - python_requires = ">=3.9,<3.12"  → use 3.9
+   - python_requires=">=3.11"  → use 3.11
+
+## Tools:
+- grep_search: Search for patterns in files
+- read_file: Read configuration files
+
+## Response Format:
+When you find the version, respond with EXACTLY:
+PYTHON_VERSION: X.Y
+
+For example:
+PYTHON_VERSION: 3.11
+
+If you cannot find any version requirement after searching, respond with:
+PYTHON_VERSION: NOT_FOUND
+
+## Rules:
+- Do NOT run any commands
+- Do NOT install anything
+- ONLY search for and report the version
+- Respond in the exact format above
+"""
+
 # System prompt for Phase 2: Dependency Installation  
 DEPS_INSTALL_PROMPT = """You are installing Python dependencies for a repository.
 
 ## TASK: Install all dependencies so the package can be tested.
 
-## Step 1: Install build dependencies (ALWAYS run this first)
-```
-.venv/bin/pip install "setuptools<70" wheel cython "numpy<2" extension_helpers setuptools_scm
-```
 
-## Step 2: Install the package with test extras (try this first)
+## Install the package with test extras (try this first)
 ```
 .venv/bin/pip install -e ".[test]" --no-build-isolation
 ```
@@ -313,8 +351,46 @@ class SweVerifiedGreenAgent(GreenAgent):
         else:
             logger.warning(f"[{phase_name}] ⚠ Reached max iterations ({max_iterations})")
 
-    async def _run_env_setup(self, repo_dir: str, file_listing: str, updater: TaskUpdater, model: str = None) -> None:
-        """Phase 1: Identify Python version, install it, create venv."""
+    async def _run_env_setup(self, repo_dir: str, file_listing: str, updater: TaskUpdater, model: str = None) -> str | None:
+        """Phase 1: Identify Python version, install it, create venv.
+        
+        Optimized flow:
+        1. Try grep/regex for fast version detection
+        2. Try limited agentic loop for version detection
+        3. If version found → run uv commands deterministically
+        4. If version not found OR uv commands fail → full agentic loop
+        
+        Returns:
+            The detected Python version string (e.g., "3.8") or None if agentic fallback was used.
+        """
+        python_version = None
+        
+        # Step 1: Try fast grep-based detection
+        logger.info("[ENV_SETUP] Step 1: Trying grep-based version detection...")
+        python_version = self._try_grep_python_version(repo_dir)
+        
+        # Step 2: Try agentic version detection if grep failed
+        if not python_version:
+            logger.info("[ENV_SETUP] Step 2: Trying agentic version detection...")
+            python_version = await self._find_python_version_agentic(
+                repo_dir, file_listing, updater, model=model
+            )
+        
+        # Step 3: If version found, try uv commands deterministically
+        if python_version:
+            logger.info(f"[ENV_SETUP] Step 3: Running uv commands with Python {python_version}...")
+            uv_success = await self._run_uv_commands(repo_dir, python_version, updater)
+            
+            if uv_success:
+                logger.info("[ENV_SETUP] ✓ Environment setup complete (optimized path)")
+                return python_version
+            else:
+                logger.info("[ENV_SETUP] UV commands failed, falling back to full agentic loop...")
+        else:
+            logger.info("[ENV_SETUP] No version found, falling back to full agentic loop...")
+        
+        # Step 4: Fall back to full agentic loop
+        logger.info("[ENV_SETUP] Step 4: Running full agentic loop...")
         await self._run_agentic_loop(
             repo_dir=repo_dir,
             system_prompt=ENV_SETUP_PROMPT,
@@ -324,9 +400,245 @@ class SweVerifiedGreenAgent(GreenAgent):
             max_iterations=8,
             model=model
         )
+        return python_version  # May be None if agentic loop was used
 
-    async def _run_deps_install(self, repo_dir: str, file_listing: str, updater: TaskUpdater, model: str = None) -> None:
-        """Phase 2: Install build deps, package, and test deps."""
+    def _try_grep_python_version(self, repo_dir: str) -> str | None:
+        """Try to find Python version using grep and regex (fast path).
+        
+        Returns:
+            Version string (e.g., "3.11") or None if not found.
+        """
+        # Search for version requirements
+        logger.info("[GREP_VERSION] Searching for 'requires-python|python_requires'...")
+        result = grep_search(repo_dir, "requires-python|python_requires")
+        
+        if "No matches found" in result or "Error" in result:
+            logger.info(f"[GREP_VERSION] No matches found in grep search")
+            return None
+        
+        
+        # Parse version from common patterns
+        # Handle formats like: 
+        #   requires-python = ">=3.8"
+        #   python_requires='>=3.6'
+        #   python_requires = ">= 3.9"
+        patterns = [
+            r'requires-python\s*=\s*["\'][>=<~!\s]*(\d+\.\d+)',  # pyproject.toml
+            r'python_requires\s*=\s*["\'][>=<~!\s]*(\d+\.\d+)',  # setup.cfg/setup.py
+            r'requires-python\s*:\s*[>=<~!\s]*(\d+\.\d+)',       # YAML-style
+        ]
+        
+        for pattern in patterns:
+            logger.debug(f"[GREP_VERSION] Trying pattern: {pattern}")
+            match = re.search(pattern, result, re.IGNORECASE)
+            if match:
+                version = match.group(1)
+                logger.info(f"[GREP_VERSION] ✓ Found Python version: {version} (pattern: {pattern[:30]}...)")
+                return version
+        
+        logger.warning(f"[GREP_VERSION] Grep found matches but regex failed to extract version")
+        return None
+
+    async def _find_python_version_agentic(self, repo_dir: str, file_listing: str, 
+                                            updater: TaskUpdater, model: str = None) -> str | None:
+        """Run a limited agentic loop to find Python version.
+        
+        Uses only grep_search and read_file tools (blocks run_command).
+        Returns version string or None if not found.
+        """
+        # Limited toolset - no run_command
+        version_tools = [t for t in TOOLS if t["function"]["name"] != "run_command"]
+        
+        messages = [
+            {"role": "system", "content": FIND_PYTHON_VERSION_PROMPT},
+            {"role": "user", "content": f"Repository files:\n{file_listing}"}
+        ]
+        
+        for iteration in range(5):  # Max 5 iterations
+            logger.info(f"[FIND_VERSION] Iteration {iteration + 1}/5")
+            
+            try:
+                response = await litellm.acompletion(
+                    model=model or self._model,
+                    messages=messages,
+                    tools=version_tools,
+                    tool_choice="auto"
+                )
+            except Exception as e:
+                logger.error(f"[FIND_VERSION] LLM call failed: {e}")
+                return None
+            
+            assistant_message = response.choices[0].message
+            messages.append(assistant_message.model_dump())
+            
+            # Check for version in response
+            if assistant_message.content:
+                version_match = re.search(r'PYTHON_VERSION:\s*(\d+\.\d+)', assistant_message.content)
+                if version_match:
+                    version = version_match.group(1)
+                    logger.info(f"[FIND_VERSION] Found version: {version}")
+                    return version
+                if "NOT_FOUND" in assistant_message.content:
+                    logger.info("[FIND_VERSION] Version not found by LLM")
+                    return None
+            
+            # Handle tool calls (only grep_search and read_file)
+            if not assistant_message.tool_calls:
+                continue
+                
+            for tool_call in assistant_message.tool_calls:
+                func_name = tool_call.function.name
+                args = json.loads(tool_call.function.arguments) if tool_call.function.arguments else {}
+                
+                if func_name == "run_command":
+                    # Block command execution in version-finding phase
+                    result = "Error: run_command is not available. Only use grep_search and read_file."
+                elif func_name == "read_file":
+                    result = read_file(repo_dir, args.get("file_path", ""))
+                elif func_name == "grep_search":
+                    result = grep_search(repo_dir, args.get("pattern", ""))
+                else:
+                    result = f"Unknown tool: {func_name}"
+                
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": result
+                })
+        
+        logger.warning("[FIND_VERSION] Max iterations reached without finding version")
+        return None
+
+    async def _run_uv_commands(self, repo_dir: str, python_version: str, 
+                                updater: TaskUpdater) -> bool:
+        """Run uv commands deterministically to set up the environment.
+        
+        Returns:
+            True if all commands succeeded, False otherwise.
+        """
+        commands = [
+            f"uv python install {python_version}",
+            f"uv venv --python {python_version}",
+            "uv pip install pip --python .venv/bin/python"
+        ]
+        
+        for cmd in commands:
+            logger.info(f"[ENV_SETUP] Running: {cmd}")
+            await updater.update_status(
+                TaskState.working,
+                new_agent_text_message(f"Running: {cmd}")
+            )
+            
+            result = run_command(repo_dir, cmd)
+            
+            # Check for success
+            if "Exit code: 0" not in result:
+                logger.warning(f"[ENV_SETUP] Command failed: {cmd}\n{result}")
+                return False
+            
+            logger.info(f"[ENV_SETUP] ✓ Command succeeded: {cmd}")
+        
+        logger.info("[ENV_SETUP] ✓ All uv commands succeeded")
+        return True
+
+    async def _run_build_deps(self, repo_dir: str, python_version: str, 
+                                updater: TaskUpdater) -> bool:
+        """Install build dependencies deterministically (no LLM needed).
+        
+        Uses different deps based on Python version:
+        - Python 3.8-3.11: pinned versions for compatibility
+        - Python 3.12+: modern versions
+        
+        Returns:
+            True if command succeeded, False otherwise.
+        """
+        # Parse major.minor version
+        try:
+            major, minor = map(int, python_version.split('.')[:2])
+        except ValueError:
+            major, minor = 3, 11  # Default assumption
+        
+        if major == 3 and minor < 12:
+            # Python 3.8-3.11: use pinned versions for compatibility
+            build_deps_cmd = '.venv/bin/pip install "setuptools<70" wheel cython "numpy<2" extension_helpers setuptools_scm'
+            logger.info(f"[BUILD_DEPS] Using Python {python_version} (<=3.11) compatible deps")
+        else:
+            # Python 3.12+: use modern versions
+            build_deps_cmd = '.venv/bin/pip install setuptools wheel cython numpy extension_helpers setuptools_scm'
+            logger.info(f"[BUILD_DEPS] Using Python {python_version} (>=3.12) compatible deps")
+        
+        logger.info(f"[BUILD_DEPS] Running: {build_deps_cmd}")
+        await updater.update_status(
+            TaskState.working,
+            new_agent_text_message("Installing build dependencies...")
+        )
+        
+        result = run_command(repo_dir, build_deps_cmd)
+        
+        if "Exit code: 0" not in result:
+            logger.warning(f"[BUILD_DEPS] Command failed:\n{result}")
+            return False
+        
+        logger.info("[BUILD_DEPS] ✓ Build dependencies installed")
+        return True
+
+    async def _run_deps_install(self, repo_dir: str, file_listing: str, updater: TaskUpdater, 
+                                 python_version: str = None, model: str = None) -> None:
+        """Phase 2: Install build deps, package, and test deps.
+        
+        Flow:
+        1. Install build deps deterministically (based on Python version)
+        2. Try pip install -e ".[test]" --no-build-isolation
+        3. If fails, try pip install -e . --no-build-isolation
+        4. If both fail, fall back to agentic loop
+        """
+        logger.info(f"[DEPS_INSTALL] Starting dependency installation (python_version={python_version})")
+        
+        # Step 1: Install build dependencies (deterministic, no LLM)
+        if python_version:
+            build_success = await self._run_build_deps(repo_dir, python_version, updater)
+            if not build_success:
+                logger.warning("[DEPS_INSTALL] Build deps failed, continuing anyway...")
+        else:
+            logger.warning("[DEPS_INSTALL] No Python version provided, skipping build deps")
+        
+        # Step 2: Try pip install -e ".[test]" --no-build-isolation
+        logger.info("[DEPS_INSTALL] Step 2: Trying pip install -e \".[test]\" --no-build-isolation...")
+        await updater.update_status(
+            TaskState.working,
+            new_agent_text_message("Installing package with test extras...")
+        )
+        
+        test_install_cmd = '.venv/bin/pip install -e ".[test]" --no-build-isolation'
+        result = run_command(repo_dir, test_install_cmd)
+        
+        if "Exit code: 0" in result:
+            logger.info("[DEPS_INSTALL] ✓ Package with test extras installed successfully")
+            return
+        
+        # Log failure details (first 500 chars of output)
+        logger.warning(f"[DEPS_INSTALL] pip install -e \".[test]\" failed. Output (first 500 chars):\n{result[:500]}")
+        
+        # Step 3: Try pip install -e . --no-build-isolation
+        logger.info("[DEPS_INSTALL] Step 3: Trying pip install -e . --no-build-isolation...")
+        await updater.update_status(
+            TaskState.working,
+            new_agent_text_message("Installing package without test extras...")
+        )
+        
+        basic_install_cmd = '.venv/bin/pip install -e . --no-build-isolation'
+        result = run_command(repo_dir, basic_install_cmd)
+        
+        if "Exit code: 0" in result:
+            logger.info("[DEPS_INSTALL] ✓ Package installed successfully (without test extras)")
+            return
+        
+        # Log failure details
+        logger.warning(f"[DEPS_INSTALL] pip install -e . failed. Output (first 500 chars):\n{result[:500]}")
+        logger.warning("[DEPS_INSTALL] Both deterministic install attempts failed, falling back to agentic loop...")
+        
+        # Step 4: Fall back to agentic loop
+        logger.info("[DEPS_INSTALL] Step 4: Starting agentic loop for dependency installation...")
         await self._run_agentic_loop(
             repo_dir=repo_dir,
             system_prompt=DEPS_INSTALL_PROMPT,
@@ -418,13 +730,13 @@ class SweVerifiedGreenAgent(GreenAgent):
                 # PHASE 2A: Environment Setup (Python + venv)
                 # =============================================
                 await updater.update_status(TaskState.working, new_agent_text_message(f"[{instance_id}] Phase 1: Setting up Python environment..."))
-                await self._run_env_setup(temp_dir, file_listing, updater, model=model)
+                python_version = await self._run_env_setup(temp_dir, file_listing, updater, model=model)
                 
                 # =============================================
                 # PHASE 2B: Dependency Installation
                 # =============================================
                 await updater.update_status(TaskState.working, new_agent_text_message(f"[{instance_id}] Phase 2: Installing dependencies..."))
-                await self._run_deps_install(temp_dir, file_listing, updater, model=model)
+                await self._run_deps_install(temp_dir, file_listing, updater, python_version=python_version, model=model)
                 
                 # =============================================
                 # PHASE 3: Switch to base_commit for patch application
